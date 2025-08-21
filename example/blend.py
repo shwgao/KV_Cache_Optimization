@@ -47,6 +47,7 @@ for sample_idx in range(1,11):
     doc_chunk_ids = doc_chunk_ids + [s_start+q_ids+s_end]
 
     last_len = len([q_ids+s_end])
+    # last_len = len(q_ids) + len(s_end)
 
     cache_fuse_metadata['collect'] = True
     cache_fuse_metadata["check"] = False

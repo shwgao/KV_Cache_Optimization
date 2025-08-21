@@ -220,8 +220,10 @@ class ModelConfig:
         return self.hf_text_config.hidden_size
 
     def get_head_size(self) -> int:
-        if hasattr(self.hf_text_config, "head_dim"):
-            return self.hf_text_config.head_dim
+        # Prefer explicit head_dim if provided and valid; otherwise, derive it.
+        head_dim = getattr(self.hf_text_config, "head_dim", None)
+        if isinstance(head_dim, int) and head_dim > 0:
+            return head_dim
         # FIXME(woosuk): This may not be true for all models.
         return (self.hf_text_config.hidden_size //
                 self.hf_text_config.num_attention_heads)

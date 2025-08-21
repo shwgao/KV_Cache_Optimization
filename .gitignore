@@ -1,2 +1,6 @@
 **/__pycache__
 outputs/
+data/
+analysis/results/
+inputs/example_rag_chunks.json
+results/
