@@ -74,31 +74,62 @@ def aggregate_step_chunk_attention(attentions: List[Tuple[torch.Tensor, ...]],
     """
     attentions: list over generated steps; each element is a tuple over layers of [B,H,Q,K].
     Return: {step: tensor[num_chunks]} average attention on each chunk for the new token at that step.
+    Memory-optimized version that processes layers incrementally.
     """
     step_attention: Dict[int, torch.Tensor] = {}
     for t, per_layer in enumerate(attentions):
-        L = torch.stack(per_layer, dim=0)     # [L,B,H,Q,K]
-        A = L.mean(dim=0).mean(dim=1)         # [B,Q,K]
-        a_last = A[0, -1]                     # [K]
+        # Process layers incrementally to avoid large memory allocation
+        layer_means = []
+        for layer_attn in per_layer:
+            # layer_attn: [B,H,Q,K] -> mean over heads -> [B,Q,K]
+            layer_mean = layer_attn.mean(dim=1)  # [B,Q,K]
+            layer_means.append(layer_mean)
+        
+        # Stack layer means (much smaller than stacking full attention tensors)
+        L = torch.stack(layer_means, dim=0)     # [L,B,Q,K]
+        A = L.mean(dim=0)                       # [B,Q,K] - mean over layers
+        
+        # Get attention for the NEW token (not the last token in the sequence)
+        # The new token is at position -1 in the attention matrix
+        a_new_token = A[0, -1]                  # [K] - new token's attention to all previous tokens
 
         scores = []
-        K = a_last.shape[0]
+        K = a_new_token.shape[0]
         for (s,e) in chunk_spans:
             s_clip = min(max(s, 0), K)
             e_clip = min(max(e, 0), K)
             if e_clip > s_clip:
-                scores.append(a_last[s_clip:e_clip].mean())
+                # Use max attention within chunk span for better detection
+                scores.append(a_new_token[s_clip:e_clip].max())
             else:
-                scores.append(torch.tensor(0.0, device=a_last.device))
+                scores.append(torch.tensor(0.0, device=a_new_token.device))
         step_attention[t] = torch.stack(scores)  # [num_chunks]
+        
+        # Clear intermediate tensors to free memory
+        del L, A, layer_means
+        torch.cuda.empty_cache()
     return step_attention
 
-def working_set(scores: np.ndarray, top_k: int) -> Set[int]:
-    """Indices of top_k chunks by score (descending)."""
+def working_set(scores: np.ndarray, top_k: int, min_threshold: float = 0.0001) -> Set[int]:
+    """Indices of top_k chunks by score (descending), with minimum threshold."""
     if scores.size == 0 or top_k <= 0:
         return set()
-    idx = np.argsort(scores)[::-1][:top_k]
-    return set(idx.tolist())
+    
+    # Filter chunks that meet minimum attention threshold
+    above_threshold = scores >= min_threshold
+    if not np.any(above_threshold):
+        # If no chunks meet threshold, take the highest scoring one
+        return {np.argmax(scores)}
+    
+    # Get indices of chunks above threshold
+    valid_indices = np.where(above_threshold)[0]
+    valid_scores = scores[valid_indices]
+    
+    # Sort by score and take top_k
+    sorted_indices = valid_indices[np.argsort(valid_scores)[::-1]]
+    top_indices = sorted_indices[:min(top_k, len(sorted_indices))]
+    
+    return set(top_indices.tolist())
 
 def jaccard(a: Set[int], b: Set[int]) -> float:
     if not a and not b:
@@ -109,7 +140,7 @@ def jaccard(a: Set[int], b: Set[int]) -> float:
 
 # ------------------------- Per-sample H3a / H3b -------------------------
 
-def h3a_local_coherence(step2scores: Dict[int, torch.Tensor], top_k: int) -> Dict[str, Any]:
+def h3a_local_coherence(step2scores: Dict[int, torch.Tensor], top_k: int, attention_threshold: float = 0.0001) -> Dict[str, Any]:
     """
     J(W_t, W_{t+1}) across steps, where W_t is top_k by scores at step t.
     Returns dict with 'jaccard_scores' (list of floats), mean/median, and per-step sets (optional).
@@ -121,12 +152,21 @@ def h3a_local_coherence(step2scores: Dict[int, torch.Tensor], top_k: int) -> Dic
     W: Dict[int, Set[int]] = {}
     for t in steps:
         s = step2scores[t].detach().float().cpu().numpy()
-        s_norm = s / (s.sum() + 1e-8)
-        W[t] = working_set(s_norm, top_k)
+        # Don't normalize - use raw attention scores
+        W[t] = working_set(s, top_k, attention_threshold)
+        
+        # Debug output
+        print(f"  Step {t}: scores={s}, top_k_indices={sorted(list(W[t]))}")
+        
+        # Show attention score ranges for first few steps
+        if t < 5:
+            print(f"    Step {t}: min={s.min():.6f}, max={s.max():.6f}, mean={s.mean():.6f}")
 
     sims: List[float] = []
     for i in range(len(steps)-1):
-        sims.append(jaccard(W[steps[i]], W[steps[i+1]]))
+        sim = jaccard(W[steps[i]], W[steps[i+1]])
+        sims.append(sim)
+        print(f"  Jaccard({steps[i]}, {steps[i+1]}) = {sim:.3f}")
 
     return {
         "jaccard_scores": sims,
@@ -135,7 +175,7 @@ def h3a_local_coherence(step2scores: Dict[int, torch.Tensor], top_k: int) -> Dic
         "working_sets_per_step": {str(t): sorted(list(W[t])) for t in steps}
     }
 
-def h3b_global_drift(step2scores: Dict[int, torch.Tensor], top_k: int, intervals: List[int]) -> Dict[str, Any]:
+def h3b_global_drift(step2scores: Dict[int, torch.Tensor], top_k: int, intervals: List[int], attention_threshold: float = 0.0001) -> Dict[str, Any]:
     """
     AvgSim(k) over pairs (t, t+k).
     Returns dict {'avg_similarity_per_interval': {k: value}}
@@ -147,8 +187,8 @@ def h3b_global_drift(step2scores: Dict[int, torch.Tensor], top_k: int, intervals
     W: Dict[int, Set[int]] = {}
     for t in steps:
         s = step2scores[t].detach().float().cpu().numpy()
-        s_norm = s / (s.sum() + 1e-8)
-        W[t] = working_set(s_norm, top_k)
+        # Don't normalize - use raw attention scores
+        W[t] = working_set(s, top_k, attention_threshold)
 
     out: Dict[int, float] = {}
     for k in intervals:
@@ -170,13 +210,18 @@ def extract_chunks_question_from_sample(sample: Dict[str, Any]) -> Tuple[List[st
     query = sample.get("question", "")
     return chunks, query
 
-def load_dataset_samples(json_path: str) -> List[Tuple[List[str], str]]:
+def load_dataset_samples(json_path: str, max_chunks: Optional[int] = None, max_samples: Optional[int] = None) -> List[Tuple[List[str], str]]:
     """
     Returns list of (chunks, question) for:
      - a single MuSiQue-style dict, or
      - a list of such dicts.
     Uses load_rag_chunks for single-sample files to honor the user's loader,
     and direct iteration if the file contains many samples.
+    
+    Args:
+        json_path: Path to the JSON file
+        max_chunks: Maximum number of chunks per sample (None for no limit)
+        max_samples: Maximum number of samples to process (None for no limit)
     """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -188,19 +233,28 @@ def load_dataset_samples(json_path: str) -> List[Tuple[List[str], str]]:
             if isinstance(item, dict) and "ctxs" in item:
                 chunks, q = extract_chunks_question_from_sample(item)
                 if chunks and q:
+                    # Apply chunk limit if specified
+                    if max_chunks is not None and len(chunks) > max_chunks:
+                        chunks = chunks[:max_chunks]
                     samples.append((chunks, q))
+                    # Apply sample limit if specified
+                    if max_samples is not None and len(samples) >= max_samples:
+                        break
         return samples
 
     # single-sample cases → use the shared loader
     chunks, q, _ = load_rag_chunks(json_path)
     if chunks and (q is not None):
+        # Apply chunk limit if specified
+        if max_chunks is not None and len(chunks) > max_chunks:
+            chunks = chunks[:max_chunks]
         samples.append((chunks, q))
     return samples
 
 
 # ------------------------- Plotting helpers -------------------------
 
-def plot_h3a_hist(all_jaccards: List[float], out_path: str):
+def plot_h3a_hist(all_jaccards: List[float], out_path: str, sample_id: int = None):
     plt.figure(figsize=(10,6))
     if SEABORN_AVAILABLE:
         sns.histplot(all_jaccards, bins=30, kde=True, stat="density")
@@ -210,7 +264,14 @@ def plot_h3a_hist(all_jaccards: List[float], out_path: str):
     median_j = np.median(all_jaccards) if all_jaccards else 0.0
     plt.axvline(mean_j, linestyle="--", linewidth=2, label=f"Mean {mean_j:.2f}")
     plt.axvline(median_j, linestyle="--", linewidth=2, label=f"Median {median_j:.2f}")
-    plt.title("H3a: Jaccard similarity between consecutive steps (pooled over samples)")
+    
+    title = "H3a: Jaccard similarity between consecutive steps"
+    if sample_id is not None:
+        title += f" (Sample {sample_id})"
+    else:
+        title += " (pooled over samples)"
+    plt.title(title)
+    
     plt.xlabel("Jaccard(t, t+1)")
     plt.ylabel("Density")
     plt.xlim(0, 1)
@@ -220,7 +281,7 @@ def plot_h3a_hist(all_jaccards: List[float], out_path: str):
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
 
-def plot_h3b_decay(mean_per_k: Dict[int,float], std_per_k: Dict[int,float], out_path: str):
+def plot_h3b_decay(mean_per_k: Dict[int,float], std_per_k: Dict[int,float], out_path: str, sample_id: int = None):
     ks = sorted(mean_per_k.keys())
     ys = [mean_per_k[k] for k in ks]
     plt.figure(figsize=(10,6))
@@ -235,13 +296,22 @@ def plot_h3b_decay(mean_per_k: Dict[int,float], std_per_k: Dict[int,float], out_
     plt.ylim(0, 1.05)
     plt.xlabel("Interval k (log scale)")
     plt.ylabel("Avg Jaccard(W_t, W_{t+k})")
-    plt.title("H3b: Similarity decay vs interval k (averaged over samples)")
+    
+    title = "H3b: Similarity decay vs interval k"
+    if sample_id is not None:
+        title += f" (Sample {sample_id})"
+    else:
+        title += " (averaged over samples)"
+    plt.title(title)
+    
     plt.grid(True, which="both", linestyle="--", alpha=0.5)
     plt.legend()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
+
+
 
 
 # ------------------------- Main -------------------------
@@ -253,18 +323,26 @@ def main():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--top-k-chunks", type=int, default=5)
+    p.add_argument("--attention-threshold", type=float, default=0.0001, help="Minimum attention threshold for chunk selection")
     p.add_argument("--intervals", default="1,5,10,25,50", help="Comma-separated k values")
     p.add_argument("--out-dir", default="results/rag_temporal")
+    p.add_argument("--max-chunks", type=int, help="Maximum number of chunks per sample (default: no limit)")
+    p.add_argument("--max-samples", type=int, help="Maximum number of samples to process (default: no limit)")
+    p.add_argument("--batch-size", type=int, default=1, help="Process samples in batches (default: 1)")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load dataset samples
-    samples = load_dataset_samples(args.dataset_json)
+    samples = load_dataset_samples(args.dataset_json, args.max_chunks, args.max_samples)
     if not samples:
         print("No valid samples found.")
         sys.exit(1)
     print(f"Loaded {len(samples)} samples")
+    if args.max_chunks:
+        print(f"Limited to {args.max_chunks} chunks per sample")
+    if args.max_samples:
+        print(f"Limited to {args.max_samples} samples")
 
     # Model + tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -272,9 +350,14 @@ def main():
         args.model,
         torch_dtype=torch.float16,
         device_map=args.device,
-        attn_implementation="eager"
+        attn_implementation="eager",
+        low_cpu_mem_usage=True
     )
     model.eval()
+    
+    # Enable gradient checkpointing to save memory
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
 
     # Prepare intervals
     intervals = [int(x) for x in args.intervals.split(",") if x.strip()]
@@ -286,9 +369,14 @@ def main():
     per_sample_h3b_maps: List[Dict[int,float]] = []
 
     for si, (chunks, query) in enumerate(samples, 1):
+        print(f"\nProcessing sample {si}/{len(samples)}...")
+        print(f"  Chunks: {len(chunks)} chunks")
+        print(f"  Query: {query[:100]}...")
+        
         # Build prompt & get attentions
         prompt = build_rag_context(chunks, query)
         enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
+        print(f"  Input tokens: {enc['input_ids'].shape[1]}")
 
         with torch.no_grad():
             out = model.generate(
@@ -301,19 +389,44 @@ def main():
             )
 
         spans = compute_chunk_token_spans(tokenizer, chunks, query)
+        print(f"  Chunk spans: {spans}")
         step2scores = aggregate_step_chunk_attention(out.attentions, spans)  # {t: tensor[num_chunks]}
+        print(f"  Generated {len(step2scores)} steps")
+
+        # Debug: Check if attention scores are varying
+        print(f"  Debug: Attention score ranges:")
+        for t in sorted(step2scores.keys())[:5]:  # First 5 steps
+            scores = step2scores[t].detach().float().cpu().numpy()
+            print(f"    Step {t}: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
 
         # H3a per sample
-        h3a = h3a_local_coherence(step2scores, args.top_k_chunks)
+        print(f"  Computing H3a...")
+        h3a = h3a_local_coherence(step2scores, args.top_k_chunks, args.attention_threshold)
         pooled_jaccards.extend(h3a["jaccard_scores"])
         per_sample_h3a_means.append(h3a["mean_jaccard"])
 
         # H3b per sample
-        h3b = h3b_global_drift(step2scores, args.top_k_chunks, intervals)
+        print(f"  Computing H3b...")
+        h3b = h3b_global_drift(step2scores, args.top_k_chunks, intervals, args.attention_threshold)
         per_sample_h3b_maps.append(h3b["avg_similarity_per_interval"])
 
-        if si % 10 == 0 or si == len(samples):
-            print(f"Processed {si}/{len(samples)} samples")
+        # Create per-sample plots
+        sample_out_dir = out_dir / f"sample_{si}"
+        sample_out_dir.mkdir(exist_ok=True)
+        
+        # H3a plot for this sample
+        if h3a["jaccard_scores"]:
+            plot_h3a_hist(h3a["jaccard_scores"], str(sample_out_dir / "h3a_local_coherence.png"), sample_id=si)
+        
+        # H3b plot for this sample
+        if h3b["avg_similarity_per_interval"]:
+            plot_h3b_decay(h3b["avg_similarity_per_interval"], {}, str(sample_out_dir / "h3b_global_drift.png"), sample_id=si)
+
+        # Clear memory after each sample
+        del out, step2scores, h3a, h3b
+        torch.cuda.empty_cache()
+        
+        print(f"Completed sample {si}/{len(samples)}")
 
     # Aggregate H3b across samples (mean/std over samples at each k)
     mean_per_k: Dict[int,float] = {}
@@ -327,9 +440,11 @@ def main():
             mean_per_k[k] = 0.0
             std_per_k[k] = 0.0
 
-    # Plots
-    plot_h3a_hist(pooled_jaccards, str(out_dir / "h3a_local_coherence_hist.png"))
-    plot_h3b_decay(mean_per_k, std_per_k, str(out_dir / "h3b_global_drift.png"))
+    # Overall plots (pooled across samples)
+    if pooled_jaccards:
+        plot_h3a_hist(pooled_jaccards, str(out_dir / "h3a_local_coherence_hist.png"))
+    if mean_per_k:
+        plot_h3b_decay(mean_per_k, std_per_k, str(out_dir / "h3b_global_drift.png"))
 
     # Save JSON summary
     summary = {

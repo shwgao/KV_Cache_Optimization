@@ -5,8 +5,8 @@ MODEL="meta-llama/Meta-Llama-3-8B"
 CHUNKS_JSON="inputs/musique_s.json"
 DEVICE="cuda:0"
 MAX_NEW_TOKENS=256
-ATTN_THRESHOLD=0.10
-OUT_DIR="results/coverage"
+ATTN_THRESHOLD=0.01
+OUT_DIR="results/analysis/coverage"
 SAMPLE_LIMIT=5
 CHUNK_LIMIT=5
 
