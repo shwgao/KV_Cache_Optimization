@@ -1,0 +1,11 @@
+python ./src/rag_retrieval.py \
+  --dataset inputs/musique_s.json \
+  --action both \
+  --top-k 5 \
+  --model colbert-ir/colbertv2.0 \
+  --doc-key doc_id \
+  --text-question-key question \
+  --r-text-index-key r_text_index \
+  --r-text-key retrieved_indices \
+  --page-id-key page_ids \
+  --out_path results/retrieval/musique_s_rag_both_k5.json

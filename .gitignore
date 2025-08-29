@@ -3,4 +3,5 @@ outputs/
 data/
 analysis/results/
 inputs/example_rag_chunks.json
-results/
+colbert_index/
+.ragatouille/

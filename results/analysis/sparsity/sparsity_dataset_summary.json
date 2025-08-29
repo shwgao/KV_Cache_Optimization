@@ -1,0 +1,7 @@
+{
+  "num_samples": 5,
+  "common_steps": 256,
+  "mean_normalized_entropy_overall": 0.9199138839513832,
+  "mean_gini_overall": 0.7469467163085938,
+  "mean_top25_overall": 0.3595733642578125
+}
