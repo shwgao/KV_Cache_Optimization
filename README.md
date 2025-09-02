@@ -1,12 +1,12 @@
 ## Repository Structure
 ```
 baselines/CacheBlend/
-  analysis/                # Analysis utilities (optional)
+  analysis/                # Analysis utilities
   colbert_index/           # ColBERT/RAGatouille indices (generated)
   configs/                 # Optional configuration files
   data/                    # Optional sample data
   example/                 # Example usage artifacts
-  inputs/                  # Provided datasets (e.g., MuSiQue, Samsum)
+  inputs/                  # Provided datasets
   results/
     analysis/              # Analysis outputs
     decoding/              # Speculative decode traces
@@ -25,8 +25,7 @@ baselines/CacheBlend/
     config.py              # Pipeline configuration utilities
     kv_cache_manager.py    # CPU/GPU cache manager with CacheBlend kernels
     rag_retrieval.py       # RAGatouille (ColBERT) indexing + retrieval
-    run_pipeline.py        # End-to-end demo pipeline (optional)
-    scheduler.py           # Scheduling logic (if used)
+    run_pipeline.py        # End-to-end demo pipeline 
     speculative_decode.py  # Speculative decode with proactive promotions
     token_budget_calculator.py
   utils/
