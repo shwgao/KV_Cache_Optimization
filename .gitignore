@@ -5,3 +5,4 @@ analysis/results/
 inputs/example_rag_chunks.json
 colbert_index/
 .ragatouille/
+results/kv_caches/
