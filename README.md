@@ -1,7 +1,3 @@
-# CacheBlend (SemCache baseline)
-
-CacheBlend is a baseline in the SemCache project that explores semantic KV-cache management for retrieval-augmented generation (RAG) and speculative decoding. It builds per-sample key/value (KV) caches for retrieved document chunks, places the most relevant chunks on GPU, and dynamically promotes additional chunks from CPU to GPU during decoding to reduce time-to-first-token (TTFT) and improve throughput under strict memory budgets.
-
 ## Problem Statement
 Large language models (LLMs) incur substantial latency and memory overhead when conditioning on many retrieved documents. Traditional RAG pipelines either truncate context or re-encode long contexts repeatedly. CacheBlend addresses this by:
 - Precomputing and storing per-chunk KV caches using a target LLM.
