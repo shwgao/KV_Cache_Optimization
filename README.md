@@ -1,6 +1,6 @@
 ## Repository Structure
 ```
-baselines/CacheBlend/
+KV_Cache_Optimization/
   analysis/                # Analysis utilities
   colbert_index/           # ColBERT/RAGatouille indices (generated)
   configs/                 # Optional configuration files
@@ -35,7 +35,7 @@ baselines/CacheBlend/
 ```
 
 ## Environment Setup
-- Python requirements (minimal): see `baselines/CacheBlend/requirements.txt`.
+- Python requirements (minimal): see `requirements.txt`.
 - Additional dependencies:
   - Retrieval uses RAGatouille/ColBERT: `ragatouille` and its dependencies.
   - Transformers for model loading: `transformers`.
@@ -43,7 +43,7 @@ baselines/CacheBlend/
 
 Example installation:
 ```bash
-cd CacheBlend/vllm_blend
+cd KV_Cache_Optimization/vllm_blend
 pip install -e .
 cd ..
 pip install -r requirements.txt
@@ -52,7 +52,7 @@ pip install -r requirements.txt
 Ensure you have access to the target HF model (eg, `meta-llama/Meta-Llama-3-8B`) and appropriate GPU/CPU memory.
 
 ## Datasets
-Sample inputs are provided under `baselines/CacheBlend/inputs/`, eg:
+Sample inputs are provided under `KV_Cache_Optimization/inputs/`, eg:
 - `musique_s.json`
 - `wikimqa_s.json`
 - `samsum.json`
@@ -65,7 +65,7 @@ There are three main steps:
 - Writes: `results/retrieval/<dataset>_rag_both_k<k>.json`
 
 ```bash
-cd baselines/CacheBlend
+cd KV_Cache_Optimization
 bash scripts/retrieval/run_retrieval.sh
 # Default dataset: inputs/musique_s.json
 # Output: results/retrieval/musique_s_rag_both_k5.json
@@ -79,7 +79,7 @@ bash scripts/retrieval/run_retrieval.sh
   - Per-chunk KV folders under `results/kv_caches/` when `--save-cache-dir` is enabled (default in script)
 
 ```bash
-cd baselines/CacheBlend
+cd KV_Cache_Optimization
 bash scripts/build_kv_cache.sh
 # Output summary: results/kv_caches/musique_s_kv_top5.json
 # Saved chunk KV: results/kv_caches/<sample_chunk_id>/{keys.pt,values.pt,valid_mask.pt,metadata.json}
@@ -93,17 +93,17 @@ bash scripts/build_kv_cache.sh
 - Writes: `results/decoding/speculative_trace.json`
 
 ```bash
-cd baselines/CacheBlend
+cd KV_Cache_Optimization
 bash scripts/decoding/run_speculative_decode.sh
 # Output: results/decoding/speculative_trace.json
 ```
 
 ## Where to Find Results
-- Retrieval outputs: `baselines/CacheBlend/results/retrieval/`
+- Retrieval outputs: `KV_Cache_Optimization/results/retrieval/`
   - e.g `musique_s_rag_both_k5.json`
-- KV cache summary and per-chunk KV: `baselines/CacheBlend/results/kv_caches/`
+- KV cache summary and per-chunk KV: `KV_Cache_Optimization/results/kv_caches/`
   - e.g `musique_s_kv_top5.json`, plus per-chunk folders
-- Speculative decode trace and answers: `baselines/CacheBlend/results/decoding/`
+- Speculative decode trace and answers: `KV_Cache_Optimization/results/decoding/`
   - e.g `speculative_trace.json`
 
 
@@ -114,7 +114,7 @@ bash scripts/decoding/run_speculative_decode.sh
 
 ## Quickstart
 ```bash
-cd baselines/CacheBlend
+cd KV_Cache_Optimization
 # 1) Retrieval
 bash scripts/retrieval/run_retrieval.sh
 # 2) Build KV caches
