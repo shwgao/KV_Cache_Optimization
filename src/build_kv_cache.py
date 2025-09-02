@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Build KV caches from a retrieval JSON, storing top-K chunks on GPU and the rest on CPU,
 using only CacheBlend kernels (no default fallbacks).
@@ -37,7 +36,7 @@ def _prefill_get_past(model, inputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
             output_hidden_states=False,
             return_dict=True,
         )
-    # Unify to expected shape: list of (k, v)
+    
     pkv = out.past_key_values
     return {"past_key_values": pkv}
 
@@ -108,7 +107,7 @@ def _save_chunk(cache_dir: str, entry: KVCacheEntry) -> None:
     os.makedirs(cache_dir, exist_ok=True)
     cdir = os.path.join(cache_dir, entry.metadata.chunk_id)
     os.makedirs(cdir, exist_ok=True)
-    # Persist tensors on CPU to avoid device coupling
+   
     torch.save(entry.keys.cpu(), os.path.join(cdir, "keys.pt"))
     torch.save(entry.values.cpu(), os.path.join(cdir, "values.pt"))
     torch.save(entry.valid_mask.cpu(), os.path.join(cdir, "valid_mask.pt"))
@@ -153,7 +152,7 @@ def main() -> None:
 
     with open(args.retrieval_json, "r") as f:
         data = json.load(f)
-    # support two formats: { "results": [...] } or list
+
     samples = data.get("results") if isinstance(data, dict) and "results" in data else data
     if not isinstance(samples, list) or len(samples) == 0:
         raise SystemExit("Retrieval JSON is empty or invalid")
@@ -200,7 +199,7 @@ def main() -> None:
             "cache_stats": stats,
             "elapsed_sec": time.time() - start,
     }
-    # Optionally persist KV entries to disk
+    
     if args.save_cache_dir:
         for cid, entry in manager.gpu_cache.items():
             _save_chunk(args.save_cache_dir, entry)
@@ -228,6 +227,7 @@ def main() -> None:
     with open(out_path, 'w') as f:
         json.dump(payload, f, indent=2)
     print(f"Saved cache summary to: {out_path}")
+
 
 
 if __name__ == "__main__":

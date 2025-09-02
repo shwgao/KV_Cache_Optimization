@@ -89,10 +89,10 @@ class KVCacheManager:
                 module_dir = os.path.dirname(__file__)
                 if module_dir and module_dir not in sys.path:
                     sys.path.insert(0, module_dir)
-                from cacheblend_kernels import CacheBlendKernels  # type: ignore
+                from cacheblend_kernels import CacheBlendKernels  
             except ImportError:
                 # Fallback to relative if package context exists
-                from .cacheblend_kernels import CacheBlendKernels  # type: ignore
+                from .cacheblend_kernels import CacheBlendKernels 
             self.kernels = CacheBlendKernels(self.device)
             logger.info("CacheBlend kernels initialized successfully")
         except ImportError as e:
@@ -142,14 +142,12 @@ class KVCacheManager:
                 k, v = layer_kv
             else:
                 k, v = layer_kv["key"], layer_kv["value"]
-            # Expect k/v as [batch, num_heads, seq_len, head_dim]; convert to [seq_len, num_heads, head_dim]
             if k.dim() == 4:
                 k = k[0].permute(1, 0, 2).contiguous()
             if v.dim() == 4:
                 v = v[0].permute(1, 0, 2).contiguous()
             keys.append(k)
             values.append(v)
-            # All positions valid for precomputed chunks; mask over seq_len
             mask = torch.ones(k.shape[0], dtype=torch.bool, device="cpu")
             valid_mask.append(mask)
         
@@ -229,7 +227,6 @@ class KVCacheManager:
             while (len(self.gpu_cache) >= self.max_gpu_chunks) or \
                   (self.gpu_memory_used + kv_entry.metadata.size_bytes > self.gpu_memory_limit):
                 self._evict_gpu_chunk()
-                # If nothing left to evict and still no room, break
                 if len(self.gpu_cache) == 0 and \
                    (kv_entry.metadata.size_bytes > self.gpu_memory_limit):
                     logger.warning("KV entry larger than GPU memory limit; cannot store on GPU")
