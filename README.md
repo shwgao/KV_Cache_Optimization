@@ -1,6 +1,6 @@
 ## Problem Statement
 Large language models (LLMs) incur substantial latency and memory overhead when conditioning on many retrieved documents. Traditional RAG pipelines either truncate context or re-encode long contexts repeatedly. CacheBlend addresses this by:
-- Precomputing and storing per-chunk KV caches using a target LLM.
+- Precomputing and storing per-chunk KV caches using an LLM.
 - Keeping only the top-K most relevant chunks on GPU while staging remaining chunks on CPU as placeholders.
 - During speculative decoding, proactively promoting likely-needed CPU chunks to GPU using a lightweight relevance proxy, enabling fast, memory-aware decoding.
 
@@ -45,19 +45,18 @@ baselines/CacheBlend/
 
 ## Environment Setup
 - Python requirements (minimal): see `baselines/CacheBlend/requirements.txt`.
-  - Packages used by core scripts include: `torch`, `rouge_score`, `psutil`.
 - Additional dependencies:
-  - Retrieval uses RAGatouille/ColBERT: `ragatouille` and its dependencies (install per their docs).
+  - Retrieval uses RAGatouille/ColBERT: `ragatouille` and its dependencies.
   - Transformers for model loading: `transformers`.
   - tqdm for progress bars.
 
-Example install (adjust as needed):
+Example installation:
 ```bash
 pip install -r baselines/CacheBlend/requirements.txt
 pip install transformers tqdm ragatouille
 ```
 
-Ensure you have access to the target HF model (e.g., `meta-llama/Meta-Llama-3-8B`) and appropriate GPU/CPU memory.
+Ensure you have access to the target HF model (eg, `meta-llama/Meta-Llama-3-8B`) and appropriate GPU/CPU memory.
 
 ## Datasets
 Sample inputs are provided under `baselines/CacheBlend/inputs/`, e.g.:
@@ -93,7 +92,7 @@ bash scripts/build_kv_cache.sh
 # Saved chunk KV: results/kv_caches/<sample_chunk_id>/{keys.pt,values.pt,valid_mask.pt,metadata.json}
 ```
 
-3) Speculative Decode with Promotions (optional demo)
+3) Speculative Decode
 - Script: `scripts/decoding/run_speculative_decode.sh`
 - Reads:
   - Retrieval JSON (from step 1)
@@ -108,15 +107,15 @@ bash scripts/decoding/run_speculative_decode.sh
 
 ## Where to Find Results
 - Retrieval outputs: `baselines/CacheBlend/results/retrieval/`
-  - e.g., `musique_s_rag_both_k5.json`
+  - e.g `musique_s_rag_both_k5.json`
 - KV cache summary and per-chunk KV: `baselines/CacheBlend/results/kv_caches/`
-  - e.g., `musique_s_kv_top5.json`, plus per-chunk folders
+  - e.g `musique_s_kv_top5.json`, plus per-chunk folders
 - Speculative decode trace and answers: `baselines/CacheBlend/results/decoding/`
-  - e.g., `speculative_trace.json`
+  - e.g `speculative_trace.json`
 
 
 ## Notes
-- Default values in the provided shell scripts can be overridden via environment variables (see scripts).
+- Default values in the provided shell scripts can be overridden via environment variables.
 - Ensure sufficient GPU/CPU memory for the chosen model and `top-k`.
 - If CacheBlend kernels are required (`require_kernels=True` in `KVCacheManager`), ensure `vllm_blend` is importable.
 
@@ -127,6 +126,6 @@ cd baselines/CacheBlend
 bash scripts/retrieval/run_retrieval.sh
 # 2) Build KV caches
 bash scripts/build_kv_cache.sh
-# 3) Speculative decode (optional demo)
+# 3) Speculative decode
 bash scripts/decoding/run_speculative_decode.sh
 ```
