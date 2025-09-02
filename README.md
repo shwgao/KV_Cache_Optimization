@@ -1,11 +1,3 @@
-## Problem Statement
-Large language models (LLMs) incur substantial latency and memory overhead when conditioning on many retrieved documents. Traditional RAG pipelines either truncate context or re-encode long contexts repeatedly. CacheBlend addresses this by:
-- Precomputing and storing per-chunk KV caches using an LLM.
-- Keeping only the top-K most relevant chunks on GPU while staging remaining chunks on CPU as placeholders.
-- During speculative decoding, proactively promoting likely-needed CPU chunks to GPU using a lightweight relevance proxy, enabling fast, memory-aware decoding.
-
-This approach aims to balance quality (by retaining more context across many candidates) and performance (by efficiently managing GPU memory and minimizing redundant computation).
-
 ## Repository Structure
 ```
 baselines/CacheBlend/
