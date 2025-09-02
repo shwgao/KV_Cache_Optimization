@@ -4,7 +4,7 @@ Unified RAGatouille indexing + top-k retrieval on a JSON dataset.
 
 - Per-sample indexing with RAGatouille (ColBERT under the hood)
 - Top-k retrieval returning indices and scores
-- Compatible with datasets that have per-sample contexts (e.g., "ctxs")
+- Compatible with datasets that have per-sample contexts (e.g "ctxs")
 
 You can run in two phases or do both:
   1) prepare (build per-sample index)

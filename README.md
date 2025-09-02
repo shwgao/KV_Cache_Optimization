@@ -52,14 +52,16 @@ baselines/CacheBlend/
 
 Example installation:
 ```bash
-pip install -r baselines/CacheBlend/requirements.txt
-pip install transformers tqdm ragatouille
+cd CacheBlend/vllm_blend
+pip install -e .
+cd ..
+pip install -r requirements.txt
 ```
 
 Ensure you have access to the target HF model (eg, `meta-llama/Meta-Llama-3-8B`) and appropriate GPU/CPU memory.
 
 ## Datasets
-Sample inputs are provided under `baselines/CacheBlend/inputs/`, e.g.:
+Sample inputs are provided under `baselines/CacheBlend/inputs/`, eg:
 - `musique_s.json`
 - `wikimqa_s.json`
 - `samsum.json`

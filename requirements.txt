@@ -1,3 +1,7 @@
 rouge_score
 psutil
 torch
+transformers
+tqdm
+ragatouille
+colbert-ir
