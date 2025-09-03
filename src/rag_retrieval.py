@@ -9,26 +9,6 @@ Unified RAGatouille indexing + top-k retrieval on a JSON dataset.
 You can run in two phases or do both:
   1) prepare (build per-sample index)
   2) retrieve (compute top-k indices/scores)
-
-Example:
-  Prepare:
-    python baselines/CacheBlend/src/rag_retrieval_single.py \
-      --dataset inputs/musique_s.json \
-      --action prepare \
-      --model colbert-ir/colbertv2.0
-
-  Retrieve:
-    python baselines/CacheBlend/src/rag_retrieval_single.py \
-      --dataset inputs/musique_s.json \
-      --action retrieve \
-      --top-k 8
-
-  Both:
-    python baselines/CacheBlend/src/rag_retrieval_single.py \
-      --dataset inputs/musique_s.json \
-      --action both \
-      --top-k 8 \
-      --model colbert-ir/colbertv2.0
 """
 
 import os
