@@ -1,717 +1,526 @@
-#!/usr/bin/env python3
-"""
-Novel Adaptive Temporal Locality Scheduler with Predictive Prefetching
-Implements cutting-edge strategies to minimize communication delays:
-
-1. Temporal Locality Prediction: Uses attention patterns and token sequences to predict future chunk needs
-2. Adaptive Prefetching: Dynamically adjusts prefetch strategies based on prediction accuracy
-3. Bandwidth-Aware Scheduling: Optimizes transfer timing based on GPU memory pressure and available bandwidth
-4. Context-Aware Prioritization: Uses semantic similarity and access patterns to prioritize chunks
-5. Predictive Eviction: Anticipates which GPU chunks can be safely moved to CPU
-
-This scheduler is designed to work seamlessly with CacheBlend kernels and speculative decoding.
-"""
+from __future__ import annotations
+import os
+import json
+import time
+from typing import Any, Dict, List, Tuple, Set, Optional
 
 import torch
-import time
-import threading
-import numpy as np
-from typing import List, Dict, Tuple, Optional, Any, Set, NamedTuple
-import logging
-from dataclasses import dataclass
-from collections import defaultdict, deque
-import heapq
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import math
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-logger = logging.getLogger(__name__)
+from tqdm import tqdm
 
-@dataclass
-class ChunkPrediction:
-    """Prediction for chunk access timing and probability"""
-    chunk_id: str
-    probability: float
-    expected_time: float  # When the chunk will be needed (in seconds)
-    confidence: float
-    access_pattern: str  # "sequential", "random", "burst", "sparse"
-    semantic_relevance: float
+# Project helpers
+from kv_cache_manager import KVCacheManager, KVCacheEntry, ChunkMetadata
+from build_kv_cache import extract_texts, _tokenize_chunk, _prefill_get_past
 
-@dataclass
-class TransferOperation:
-    """Represents a chunk transfer operation with priority and timing"""
-    chunk_id: str
-    source: str  # "gpu" or "cpu"
-    destination: str  # "gpu" or "cpu"
-    priority: float
-    estimated_transfer_time: float
-    size_bytes: int
-    reason: str
-    deadline: float  # When this transfer must complete
-    bandwidth_requirement: float  # Required bandwidth (GB/s)
-    is_prefetch: bool  # Whether this is a proactive prefetch
 
-@dataclass
-class SchedulerMetrics:
-    """Comprehensive metrics for scheduler performance"""
-    total_transfers: int
-    gpu_to_cpu_transfers: int
-    cpu_to_gpu_transfers: int
-    prefetch_transfers: int
-    average_transfer_time: float
-    prediction_accuracy: float
-    bandwidth_utilization: float
-    memory_efficiency: float
-    cache_hit_rate: float
-    prefetch_hit_rate: float
-    transfer_overlap: float  # Percentage of transfers that overlap with computation
+# ------------------------------ Disk loader for precomputed KV ------------------------------
 
-class AdaptiveTemporalScheduler:
+def _safe_load_tensor(path: str):
+    return torch.load(path, map_location="cpu")
+
+def _dir_has_kv(dir_path: str) -> bool:
+    return all(os.path.isfile(os.path.join(dir_path, f)) for f in ["keys.pt", "values.pt", "valid_mask.pt"])
+
+def _load_kv_cache_dir(
+    cache_dir: str,
+    kv: KVCacheManager,
+    filter_prefix: str = "",
+    load_to_gpu: bool = False,
+    device: str = "cuda:0",
+) -> int:
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return 0
+
+    loaded = 0
+    for name in os.listdir(cache_dir):
+        if filter_prefix and not name.startswith(filter_prefix):
+            continue
+        cdir = os.path.join(cache_dir, name)
+        if not os.path.isdir(cdir) or not _dir_has_kv(cdir):
+            continue
+
+        meta_path = os.path.join(cdir, "metadata.json")
+        keys = _safe_load_tensor(os.path.join(cdir, "keys.pt"))
+        values = _safe_load_tensor(os.path.join(cdir, "values.pt"))
+        valid_mask = _safe_load_tensor(os.path.join(cdir, "valid_mask.pt"))
+
+        meta = {}
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+
+        size_bytes = int(meta.get("size_bytes", 0))
+        if size_bytes <= 0:
+            size_bytes = keys.element_size() * keys.nelement() + values.element_size() * values.nelement()
+
+        entry = KVCacheEntry(
+            keys=keys,
+            values=values,
+            valid_mask=valid_mask,
+            metadata=ChunkMetadata(
+                chunk_id=meta.get("chunk_id", name),
+                text=meta.get("text", ""),
+                tokens=meta.get("tokens", []),
+                relevance_score=float(meta.get("relevance_score", 0.0)),
+                access_count=int(meta.get("access_count", 0)),
+                last_access_time=float(meta.get("last_access_time", 0.0)),
+                size_bytes=size_bytes,
+                layer_count=int(meta.get("layer_count", 0)) or (keys.shape[0] if keys.ndim >= 3 else 0),
+                is_on_gpu=bool(meta.get("is_on_gpu", False)),
+            ),
+        )
+
+        if load_to_gpu:
+            device_t = torch.device(device)
+            entry.keys = entry.keys.to(device_t)
+            entry.values = entry.values.to(device_t)
+            entry.metadata.is_on_gpu = True
+            kv.store_chunk(entry.metadata.chunk_id, entry, priority="gpu")
+        else:
+            entry.metadata.is_on_gpu = False
+            kv.store_chunk(entry.metadata.chunk_id, entry, priority="cpu")
+
+        loaded += 1
+    return loaded
+
+
+# ------------------------------ Transfers & materialization ------------------------------
+
+def _transfer_gpu_to_cpu(kv: KVCacheManager, chunk_id: str) -> float:
+    start = time.time()
+    entry = kv.gpu_cache[chunk_id]
+    entry.keys = entry.keys.cpu()
+    entry.values = entry.values.cpu()
+    entry.metadata.is_on_gpu = False
+    kv.cpu_cache[chunk_id] = entry
+    kv.gpu_memory_used -= entry.metadata.size_bytes
+    kv.cpu_memory_used += entry.metadata.size_bytes
+    del kv.gpu_cache[chunk_id]
+    return time.time() - start
+
+def _transfer_cpu_to_gpu(kv: KVCacheManager, chunk_id: str, device: str) -> float:
+    start = time.time()
+    entry = kv.cpu_cache[chunk_id]
+    entry.keys = entry.keys.to(device)
+    entry.values = entry.values.to(device)
+    entry.metadata.is_on_gpu = True
+    kv.gpu_cache[chunk_id] = entry
+    kv.gpu_memory_used += entry.metadata.size_bytes
+    kv.cpu_memory_used -= entry.metadata.size_bytes
+    del kv.cpu_cache[chunk_id]
+    return time.time() - start
+
+@torch.inference_mode()
+def _materialize_placeholder_on_lowprio(
+    kv: KVCacheManager,
+    tokenizer,
+    model,
+    device: torch.device,
+    sample_id: str,
+    idx: int,
+    text: str,
+    lowprio_stream: Optional[torch.cuda.Stream],
+) -> Tuple[str, float]:
+    cid = f"{sample_id}_chunk{idx}"
+    start = time.time()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        with torch.cuda.stream(lowprio_stream) if lowprio_stream is not None else torch.cuda.stream(torch.cuda.current_stream()):
+            inputs = _tokenize_chunk(tokenizer, text, device)
+            outputs = _prefill_get_past(model, inputs)
+        torch.cuda.synchronize(device)
+    else:
+        inputs = _tokenize_chunk(tokenizer, text, device)
+        outputs = _prefill_get_past(model, inputs)
+
+    entry = kv.create_kv_cache_entry(
+        chunk_id=cid,
+        text=text,
+        tokens=tokenizer.encode(text, add_special_tokens=False),
+        relevance_score=0.0,
+        model_outputs=outputs,
+    )
+    kv.store_chunk(cid, entry, priority="cpu")  # CPU_READY
+    entry.metadata.is_on_gpu = False
+    entry.metadata.prefill_time_s = time.time() - start
+    return cid, entry.metadata.prefill_time_s
+
+
+# ------------------------------ Scoring & eviction ------------------------------
+
+def _score_chunk(
+    cid: str,
+    kv: KVCacheManager,
+    sim: float,
+    now: float,
+    bw_gbps: float,
+    max_cost_normalizer_s: float = 0.2,
+    weights: Dict[str, float] = None,
+) -> float:
+    if weights is None:
+        weights = dict(w_sim=.45, w_temp=.20, w_rec=.15, w_aft=.10, w_pin=.20, w_cost=.35)
+
+    e = kv.gpu_cache.get(cid) or kv.cpu_cache.get(cid)
+    if e is None:
+        return -1e9
+
+    sim = max(0.0, min(1.0, float(sim)))
+    temp = float(getattr(e.metadata, "temporal_locality", 0.0))
+    rec = 1.0 if now - float(getattr(e.metadata, "last_access_time", 0.0)) < 0.5 else 0.0
+    aft = min(1.0, float(getattr(e.metadata, "access_count", 0.0)) / 5.0)
+    pin = 1.0 if bool(getattr(e.metadata, "pinned", False)) else 0.0
+
+    if e.metadata.is_on_gpu:
+        cost_s = 0.0
+    else:
+        has_kv = (e.keys is not None) and (e.keys.numel() > 0)
+        size_gb = max(1e-9, e.metadata.size_bytes / (1024 ** 3))
+        xfer = size_gb / max(1e-6, bw_gbps)
+        mat = 0.0 if has_kv else float(getattr(e.metadata, "prefill_time_s", 0.05))
+        cost_s = mat + xfer
+
+    cost = min(1.0, cost_s / max_cost_normalizer_s)
+
+    return (weights["w_sim"] * sim
+            + weights["w_temp"] * temp
+            + weights["w_rec"] * rec
+            + weights["w_aft"] * aft
+            + weights["w_pin"] * pin
+            - weights["w_cost"] * cost)
+
+def _pick_evictions(
+    gpu_set: Set[str],
+    target_set: Set[str],
+    kv: KVCacheManager,
+    scores: Dict[str, float],
+    now: float,
+    need_free: int,
+) -> List[str]:
+    if need_free <= 0:
+        return list(gpu_set - target_set)
+
+    candidates = list(gpu_set - target_set) or list(gpu_set)
+
+    def evict_score(c):
+        s = scores.get(c, -1e9)
+        entry = (kv.gpu_cache.get(c) or kv.cpu_cache.get(c))
+        pin = 1.0 if bool(getattr(entry.metadata, "pinned", False)) else 0.0
+        cool_until = float(getattr(entry.metadata, "cooldown_until", 0.0))
+        on_cooldown = 1.0 if now < cool_until else 0.0
+        return s - 0.8 * pin - 0.6 * on_cooldown
+
+    return sorted(candidates, key=evict_score)[:need_free]
+
+
+# ------------------------------ Scheduler (pipeline API) ------------------------------
+
+class TangoScheduler:
     """
-    Novel scheduler implementing Adaptive Temporal Locality with Predictive Prefetching.
-    
-    Key Innovations:
-    - Temporal locality prediction using attention pattern analysis
-    - Adaptive prefetching with dynamic strategy adjustment
-    - Bandwidth-aware scheduling with transfer overlap optimization
-    - Predictive eviction based on access pattern analysis
-    - Context-aware prioritization using semantic similarity
+    Wraps the original TANGO driver for direct use inside pipeline.py.
     """
-    
-    def __init__(
+
+    def run(
         self,
-        kv_cache_manager,
-        speculative_decoder,
-        max_concurrent_transfers: int = 3,
-        prediction_horizon: float = 2.0,  # Look ahead 2 seconds
-        bandwidth_threshold: float = 0.8,  # Use 80% of available bandwidth
-        device: str = "cuda",
-        enable_predictive_eviction: bool = True,
-        enable_adaptive_prefetching: bool = True
-    ):
-        self.kv_cache_manager = kv_cache_manager
-        self.speculative_decoder = speculative_decoder
-        self.max_concurrent_transfers = max_concurrent_transfers
-        self.prediction_horizon = prediction_horizon
-        self.bandwidth_threshold = bandwidth_threshold
-        self.device = device
-        self.enable_predictive_eviction = enable_predictive_eviction
-        self.enable_adaptive_prefetching = enable_adaptive_prefetching
-        
-        # Scheduler state
-        self.transfer_queue = []
-        self.active_transfers = set()
-        self.transfer_history = deque(maxlen=1000)
-        self.prediction_history = deque(maxlen=500)
-        
-        # Performance tracking
-        self.bandwidth_measurements = deque(maxlen=100)
-        self.memory_pressure_history = deque(maxlen=100)
-        self.access_pattern_history = defaultdict(lambda: deque(maxlen=50))
-        
-        # Adaptive parameters
-        self.prefetch_aggressiveness = 0.7  # 0.0 = conservative, 1.0 = aggressive
-        self.eviction_threshold = 0.3  # Probability threshold for eviction
-        self.temporal_weight = 0.6  # Weight for temporal locality vs semantic relevance
-        
-        # Metrics
-        self.metrics = SchedulerMetrics(
-            total_transfers=0,
-            gpu_to_cpu_transfers=0,
-            cpu_to_gpu_transfers=0,
-            prefetch_transfers=0,
-            average_transfer_time=0.0,
-            prediction_accuracy=0.0,
-            bandwidth_utilization=0.0,
-            memory_efficiency=0.0,
-            cache_hit_rate=0.0,
-            prefetch_hit_rate=0.0,
-            transfer_overlap=0.0
-        )
-        
-        # Threading
-        self.scheduler_thread = None
-        self.running = False
-        self.lock = threading.Lock()
-        
-        # Initialize background scheduler
-        self._start_scheduler()
-    
-    def _start_scheduler(self):
-        """Start the background scheduler thread"""
-        self.running = True
-        self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
-        self.scheduler_thread.start()
-        logger.info("Adaptive Temporal Scheduler started")
-    
-    def _scheduler_loop(self):
-        """Main scheduler loop with adaptive decision making"""
-        while self.running:
+        pred_payload: Dict[str, Any],
+        retr_samples: List[Dict[str, Any]],
+        model_id: str,
+        device: str = "cuda:0",
+        dtype: str = "auto",                 # "auto" | "bf16" | "fp16" | "fp32"
+        max_gpu: int = 5,
+        step_duration_ms: int = 50,
+        safety_margin_ms: int = 30,
+        max_samples: int = 1,
+        load_cache_dir: str = "",
+        cache_filter_prefix: str = "auto",
+        load_initial_to_gpu: bool = False,
+        out_path: Optional[str] = None,
+        enable_progress: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Execute scheduling and return {"trace": [...]}.
+        """
+        device_t = torch.device(device)
+        if dtype == "bf16":
+            torch_dtype = torch.bfloat16
+        elif dtype == "fp16":
+            torch_dtype = torch.float16
+        elif dtype == "fp32":
+            torch_dtype = torch.float32
+        else:
+            torch_dtype = torch.bfloat16 if (device_t.type == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability(device_t)[0] >= 8) else None
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype).to(device_t)
+        model.eval()
+
+        pred_samples = pred_payload.get("results", [])
+        pred_trace = pred_payload.get("trace", [])
+
+        if not isinstance(retr_samples, list) or not retr_samples:
+            raise RuntimeError("Retrieval samples are empty or invalid")
+        if max_samples > 0:
+            pred_samples = pred_samples[:max_samples]
+
+        # Group trace per (sample_index -> step -> promoted_indices)
+        per_sample_steps: Dict[int, Dict[int, List[int]]] = {}
+        for row in pred_trace:
+            si = int(row.get("sample_index", 0))
+            st = int(row.get("step", 0))
+            per_sample_steps.setdefault(si, {})[st] = list(map(int, row.get("promoted_indices", [])))
+
+        # EMA bandwidth estimate (GB/s)
+        bw_gbps = 5.0
+        ema_alpha = 0.2
+
+        out_trace: List[Dict[str, Any]] = []
+
+        # low-priority stream (if CUDA)
+        if device_t.type == "cuda" and torch.cuda.is_available():
             try:
-                # Measure current system state
-                self._measure_system_state()
-                
-                # Update predictions based on current context
-                self._update_predictions()
-                
-                # Process transfer queue with bandwidth awareness
-                self._process_transfer_queue()
-                
-                # Adapt scheduler parameters based on performance
-                self._adapt_scheduler_parameters()
-                
-                # Sleep for adaptive interval
-                sleep_time = self._calculate_adaptive_sleep()
-                time.sleep(sleep_time)
-                
-            except Exception as e:
-                logger.error(f"Error in scheduler loop: {e}")
-                time.sleep(1.0)
-    
-    def _measure_system_state(self):
-        """Measure current system state for adaptive decisions"""
-        # Measure GPU memory pressure
-        gpu_memory_used = self.kv_cache_manager.gpu_memory_used
-        gpu_memory_total = self.kv_cache_manager.max_gpu_memory
-        memory_pressure = gpu_memory_used / gpu_memory_total if gpu_memory_total > 0 else 0.0
-        
-        self.memory_pressure_history.append({
-            'timestamp': time.time(),
-            'pressure': memory_pressure,
-            'gpu_chunks': len(self.kv_cache_manager.gpu_cache),
-            'cpu_chunks': len(self.kv_cache_manager.cpu_cache)
-        })
-        
-        # Measure bandwidth (simplified - in practice would use CUDA events)
-        if self.transfer_history:
-            recent_transfers = list(self.transfer_history)[-10:]
-            total_size = sum(t['size_bytes'] for t in recent_transfers)
-            total_time = sum(t['transfer_time'] for t in recent_transfers)
-            if total_time > 0:
-                bandwidth = total_size / (1024**3) / total_time  # GB/s
-                self.bandwidth_measurements.append({
-                    'timestamp': time.time(),
-                    'bandwidth': bandwidth
+                low_pri, high_pri = torch.cuda.get_stream_priority_range()
+                lowprio_stream = torch.cuda.Stream(priority=high_pri)
+            except AttributeError:
+                lowprio_stream = torch.cuda.Stream()
+        else:
+            lowprio_stream = None
+
+        samp_iter = enumerate(pred_samples)
+        if enable_progress and tqdm is not None:
+            samp_iter = enumerate(tqdm(pred_samples, desc="Samples", total=len(pred_samples)))
+
+        for si, ps in samp_iter:
+            sample = retr_samples[si]
+            sample_id = str(sample.get("id", f"sample{si}"))
+            texts_idx: List[Tuple[int, str]] = extract_texts(sample)
+
+            kv = KVCacheManager(
+                model_config={
+                    "hidden_size": getattr(model.config, "hidden_size", 4096),
+                    "num_layers": getattr(model.config, "num_hidden_layers", 32),
+                    "num_attention_heads": getattr(model.config, "num_attention_heads", 32),
+                    "head_dim": getattr(model.config, "hidden_size", 4096) // max(1, getattr(model.config, "num_attention_heads", 32)),
+                    "vocab_size": getattr(model.config, "vocab_size", 32000),
+                },
+                gpu_memory_limit_gb=40.0,
+                cpu_memory_limit_gb=100.0,
+                max_gpu_chunks=max_gpu,
+                max_cpu_chunks=10_000,
+                device=str(device_t),
+                require_kernels=True,
+            )
+
+            # Preload on-disk KV (CPU_READY)
+            if load_cache_dir:
+                prefix = f"{sample_id}_chunk" if cache_filter_prefix == "auto" else cache_filter_prefix
+                _load_kv_cache_dir(
+                    cache_dir=load_cache_dir,
+                    kv=kv,
+                    filter_prefix=prefix,
+                    load_to_gpu=False,
+                    device=str(device_t),
+                )
+
+            # Initial GPU placement
+            initial_gpu_indices = list(map(int, ps.get("initial_gpu", [])))[:max_gpu]
+            for idx in initial_gpu_indices:
+                cid = f"{sample_id}_chunk{idx}"
+                if cid in kv.cpu_cache:
+                    if load_initial_to_gpu:
+                        dt = _transfer_cpu_to_gpu(kv, cid, str(device_t))
+                        entry = kv.gpu_cache[cid]
+                        entry.metadata.pinned = (idx == initial_gpu_indices[0])
+                        entry.metadata.cooldown_until = time.time() + 0.5
+                        bytes_moved = max(1, entry.metadata.size_bytes)
+                        if dt > 0:
+                            inst = (bytes_moved / (1024 ** 3)) / dt
+                            bw_gbps = ema_alpha * inst + (1 - ema_alpha) * bw_gbps
+                    else:
+                        # keep as CPU_READY; only mark metadata flags on existing placement
+                        entry = kv.cpu_cache[cid]
+                        entry.metadata.pinned = (idx == initial_gpu_indices[0])
+                        entry.metadata.cooldown_until = time.time() + 0.5
+                elif cid in kv.gpu_cache:
+                    entry = kv.gpu_cache[cid]
+                    entry.metadata.pinned = (idx == initial_gpu_indices[0])
+                    entry.metadata.cooldown_until = time.time() + 0.5
+                else:
+                    text = texts_idx[idx][1] if 0 <= idx < len(texts_idx) else ""
+                    inputs = _tokenize_chunk(tokenizer, text, device_t)
+                    outputs = _prefill_get_past(model, inputs)
+                    entry = kv.create_kv_cache_entry(
+                        chunk_id=cid,
+                        text=text,
+                        tokens=tokenizer.encode(text, add_special_tokens=False),
+                        relevance_score=1.0,
+                        model_outputs=outputs,
+                    )
+                    kv.store_chunk(cid, entry, priority="gpu")
+                    entry.metadata.pinned = (idx == initial_gpu_indices[0])
+                    entry.metadata.cooldown_until = time.time() + 0.5
+
+            # Initialize placeholders for remaining chunks
+            seen_ids = set(kv.gpu_cache.keys()) | set(kv.cpu_cache.keys())
+            for idx, text in texts_idx:
+                cid = f"{sample_id}_chunk{idx}"
+                if cid in seen_ids:
+                    continue
+                placeholder = kv.create_placeholder_entry(
+                    chunk_id=cid,
+                    text=text,
+                    tokens=tokenizer.encode(text, add_special_tokens=False),
+                    relevance_score=0.0,
+                )
+                kv.store_chunk(cid, placeholder, priority="cpu")
+
+            # Per-step scheduling
+            steps = per_sample_steps.get(si, {})
+            if not steps:
+                continue
+            start_time = time.time()
+            step_dur = step_duration_ms / 1000.0
+            safety = safety_margin_ms / 1000.0
+
+            step_iter = range(0, max(steps.keys()) + 1)
+            if enable_progress and tqdm is not None:
+                step_iter = tqdm(step_iter, desc=f"Steps (sample {si})", leave=False)
+
+            for step in step_iter:
+                now = start_time + step * step_dur
+                preds = steps.get(step, [])
+
+                sim_map: Dict[str, float] = {}
+                expected_time: Dict[str, float] = {}
+                for idx in preds:
+                    cid = f"{sample_id}_chunk{idx}"
+                    sim_map[cid] = 1.0  # unchanged: treat predicted ones as highest similarity
+                    expected_time[cid] = now + step_dur
+
+                # score all chunks
+                scores: Dict[str, float] = {}
+                for cid in list(kv.gpu_cache.keys()) + list(kv.cpu_cache.keys()):
+                    sim = sim_map.get(cid, 0.0)
+                    scores[cid] = _score_chunk(cid, kv, sim, now, bw_gbps)
+
+                all_ids = list(set(list(kv.gpu_cache.keys()) + list(kv.cpu_cache.keys())))
+
+                # Select top-`max_gpu` target set
+                target = set(sorted(all_ids, key=lambda c: scores.get(c, -1e9), reverse=True)[:max_gpu])
+
+                gpu_set = set(kv.gpu_cache.keys())
+
+                # Evict if needed
+                need_free = max(0, (len(gpu_set | target) - max_gpu))
+                evict = _pick_evictions(gpu_set, target, kv, scores, now, need_free)
+                evicted_do: List[str] = []
+                for cid in evict:
+                    if cid in kv.gpu_cache:
+                        dt = _transfer_gpu_to_cpu(kv, cid)
+                        entry = kv.cpu_cache[cid]
+                        bytes_moved = max(1, entry.metadata.size_bytes)
+                        if dt > 0:
+                            inst = (bytes_moved / (1024 ** 3)) / dt
+                            bw_gbps = 0.2 * inst + 0.8 * bw_gbps
+                        evicted_do.append(cid)
+
+                # Promotions required
+                gpu_set = set(kv.gpu_cache.keys())
+                need_promote = list(target - gpu_set)
+
+                to_promote: List[str] = []
+                to_materialize: List[int] = []
+
+                for cid in need_promote:
+                    entry = kv.cpu_cache.get(cid)
+                    if entry is None:
+                        continue
+                    has_kv = (entry.keys is not None) and (entry.keys.numel() > 0)
+                    if has_kv:
+                        to_promote.append(cid)
+                    else:
+                        try:
+                            idx = int(cid.split("_chunk")[1])
+                        except Exception:
+                            idx = -1
+                        if idx >= 0:
+                            to_materialize.append(idx)
+
+                # Materialize placeholders on low-priority stream if time allows
+                mat_done: List[str] = []
+                for idx in to_materialize:
+                    cid = f"{sample_id}_chunk{idx}"
+                    ddl = expected_time.get(cid, now + 2 * step_dur)
+                    entry = kv.cpu_cache[cid]
+                    mat_est = float(getattr(entry.metadata, "prefill_time_s", 0.05))
+                    if (ddl - now - mat_est - safety) > 0:
+                        text = texts_idx[idx][1]
+                        _, mat_time = _materialize_placeholder_on_lowprio(
+                            kv, tokenizer, model, device_t, sample_id, idx, text, lowprio_stream
+                        )
+                        entry2 = kv.cpu_cache[cid]
+                        bytes_moved = max(1, entry2.metadata.size_bytes)
+                        if mat_time > 0:
+                            inst = (bytes_moved / (1024 ** 3)) / mat_time
+                            bw_gbps = 0.2 * inst + 0.8 * bw_gbps
+                        mat_done.append(cid)
+
+                # Deadline-aware promotion decisions
+                promote_now: List[str] = []
+                for cid in list(set(to_promote) | set(mat_done)):
+                    if cid not in kv.cpu_cache:
+                        continue
+                    ddl = expected_time.get(cid, now + 2 * step_dur)
+                    entry = kv.cpu_cache[cid]
+                    size_gb = max(1e-9, entry.metadata.size_bytes / (1024 ** 3))
+                    xfer_est = size_gb / max(1e-6, bw_gbps)
+                    if (ddl - now - xfer_est - safety) > 0:
+                        promote_now.append(cid)
+
+                # Ensure space, then promote
+                gpu_free_slots = max_gpu - len(kv.gpu_cache)
+                if len(promote_now) > gpu_free_slots:
+                    extra = len(promote_now) - gpu_free_slots
+                    current_gpu = set(kv.gpu_cache.keys())
+                    victims = _pick_evictions(current_gpu, target, kv, scores, now, extra)
+                    for cid in victims:
+                        if cid in kv.gpu_cache:
+                            dt = _transfer_gpu_to_cpu(kv, cid)
+                            entry = kv.cpu_cache[cid]
+                            bytes_moved = max(1, entry.metadata.size_bytes)
+                            if dt > 0:
+                                inst = (bytes_moved / (1024 ** 3)) / dt
+                                bw_gbps = 0.2 * inst + 0.8 * bw_gbps
+
+                promoted: List[str] = []
+                for cid in promote_now:
+                    if cid in kv.cpu_cache and len(kv.gpu_cache) < max_gpu:
+                        dt = _transfer_cpu_to_gpu(kv, cid, str(device_t))
+                        entry = kv.gpu_cache[cid]
+                        entry.metadata.cooldown_until = time.time() + 0.5
+                        bytes_moved = max(1, entry.metadata.size_bytes)
+                        if dt > 0:
+                            inst = (bytes_moved / (1024 ** 3)) / dt
+                            bw_gbps = 0.2 * inst + 0.8 * bw_gbps
+                        promoted.append(cid)
+
+                out_trace.append({
+                    "sample_index": si,
+                    "step": step,
+                    "predicted_indices": [f"{sample_id}_chunk{i}" for i in preds],
+                    "materialized": mat_done,
+                    "promoted": promoted,
+                    "evicted": evicted_do,
+                    "gpu_chunks": len(kv.gpu_cache),
+                    "cpu_chunks": len(kv.cpu_cache),
+                    "bw_gbps_ema": bw_gbps,
                 })
-    
-    def _update_predictions(self):
-        """Update chunk predictions using temporal locality analysis"""
-        if not self.enable_adaptive_prefetching:
-            return
-        
-        current_time = time.time()
-        current_context = self._get_current_context()
-        
-        # Get all available chunks
-        all_chunks = list(self.kv_cache_manager.gpu_cache.keys()) + \
-                    list(self.kv_cache_manager.cpu_cache.keys())
-        
-        # Generate predictions for each chunk
-        predictions = []
-        for chunk_id in all_chunks:
-            prediction = self._predict_chunk_access(chunk_id, current_context, current_time)
-            if prediction:
-                predictions.append(prediction)
-        
-        # Update prediction history
-        self.prediction_history.append({
-            'timestamp': current_time,
-            'predictions': predictions,
-            'context': current_context
-        })
-        
-        # Schedule transfers based on predictions
-        self._schedule_predictive_transfers(predictions, current_time)
-    
-    def _predict_chunk_access(self, chunk_id: str, context: Any, current_time: float) -> Optional[ChunkPrediction]:
-        """Predict when and how likely a chunk will be accessed"""
-        # Get chunk metadata
-        entry = self._get_chunk_entry(chunk_id)
-        if not entry:
-            return None
-        
-        # Analyze access patterns
-        access_pattern = self._analyze_access_pattern(chunk_id)
-        
-        # Calculate temporal locality score
-        temporal_score = self._calculate_temporal_locality(chunk_id, context)
-        
-        # Calculate semantic relevance
-        semantic_score = self._calculate_semantic_relevance(chunk_id, context)
-        
-        # Combine scores with adaptive weights
-        combined_score = (self.temporal_weight * temporal_score + 
-                         (1 - self.temporal_weight) * semantic_score)
-        
-        # Predict access timing based on patterns
-        expected_time = self._predict_access_timing(chunk_id, access_pattern, current_time)
-        
-        # Calculate confidence based on pattern consistency
-        confidence = self._calculate_prediction_confidence(chunk_id, access_pattern)
-        
-        return ChunkPrediction(
-            chunk_id=chunk_id,
-            probability=combined_score,
-            expected_time=expected_time,
-            confidence=confidence,
-            access_pattern=access_pattern,
-            semantic_relevance=semantic_score
-        )
-    
-    def _analyze_access_pattern(self, chunk_id: str) -> str:
-        """Analyze the access pattern for a chunk"""
-        history = self.access_pattern_history[chunk_id]
-        if len(history) < 3:
-            return "sparse"
-        
-        # Calculate access intervals
-        timestamps = [h['timestamp'] for h in history]
-        intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-        
-        if not intervals:
-            return "sparse"
-        
-        mean_interval = np.mean(intervals)
-        std_interval = np.std(intervals)
-        
-        # Classify patterns
-        if std_interval < 0.1 * mean_interval:
-            return "sequential"  # Very regular access
-        elif std_interval < 0.5 * mean_interval:
-            return "burst"  # Somewhat regular
-        else:
-            return "random"  # Irregular access
-    
-    def _calculate_temporal_locality(self, chunk_id: str, context: Any) -> float:
-        """Calculate temporal locality score based on recent access patterns"""
-        history = self.access_pattern_history[chunk_id]
-        if not history:
-            return 0.0
-        
-        current_time = time.time()
-        recent_accesses = [h for h in history if current_time - h['timestamp'] < 60.0]  # Last minute
-        
-        if not recent_accesses:
-            return 0.0
-        
-        # Calculate recency and frequency scores
-        latest_access = max(h['timestamp'] for h in recent_accesses)
-        recency_score = max(0.0, 1.0 - (current_time - latest_access) / 60.0)
-        
-        frequency_score = min(1.0, len(recent_accesses) / 10.0)
-        
-        return (recency_score + frequency_score) / 2.0
-    
-    def _calculate_semantic_relevance(self, chunk_id: str, context: Any) -> float:
-        """Calculate semantic relevance score using the chunk's metadata"""
-        entry = self._get_chunk_entry(chunk_id)
-        if not entry:
-            return 0.0
-        
-        # Use relevance score from metadata if available
-        if hasattr(entry.metadata, 'relevance_score'):
-            return float(entry.metadata.relevance_score)
-        
-        # Fallback to access count-based relevance
-        access_count = getattr(entry.metadata, 'access_count', 0)
-        return min(1.0, access_count / 5.0)
-    
-    def _predict_access_timing(self, chunk_id: str, access_pattern: str, current_time: float) -> float:
-        """Predict when a chunk will be accessed next"""
-        history = self.access_pattern_history[chunk_id]
-        if len(history) < 2:
-            return current_time + 10.0  # Default prediction
-        
-        # Calculate average interval
-        timestamps = [h['timestamp'] for h in history]
-        intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-        
-        if not intervals:
-            return current_time + 10.0
-        
-        avg_interval = np.mean(intervals)
-        
-        # Adjust based on pattern
-        if access_pattern == "sequential":
-            return current_time + avg_interval * 0.8  # Slightly earlier
-        elif access_pattern == "burst":
-            return current_time + avg_interval * 1.2  # Slightly later
-        else:  # random
-            return current_time + avg_interval * 1.5  # More conservative
-    
-    def _calculate_prediction_confidence(self, chunk_id: str, access_pattern: str) -> float:
-        """Calculate confidence in the prediction"""
-        history = self.access_pattern_history[chunk_id]
-        if len(history) < 3:
-            return 0.3  # Low confidence with few samples
-        
-        # Higher confidence for regular patterns
-        if access_pattern == "sequential":
-            return 0.9
-        elif access_pattern == "burst":
-            return 0.7
-        else:  # random
-            return 0.5
-    
-    def _schedule_predictive_transfers(self, predictions: List[ChunkPrediction], current_time: float):
-        """Schedule transfers based on predictions"""
-        # Sort predictions by urgency (earliest deadline first)
-        urgent_predictions = [p for p in predictions if p.expected_time - current_time < self.prediction_horizon]
-        urgent_predictions.sort(key=lambda p: p.expected_time)
-        
-        # Schedule transfers for urgent predictions
-        for prediction in urgent_predictions:
-            if prediction.probability > self.prefetch_aggressiveness:
-                self._schedule_predictive_transfer(prediction)
-    
-    def _schedule_predictive_transfer(self, prediction: ChunkPrediction):
-        """Schedule a predictive transfer operation"""
-        chunk_id = prediction.chunk_id
-        current_location = self._get_chunk_location(chunk_id)
-        target_location = "gpu" if prediction.probability > 0.7 else "cpu"
-        
-        if current_location == target_location:
-            return  # Already in optimal location
-        
-        # Calculate transfer priority based on urgency and confidence
-        time_until_needed = prediction.expected_time - time.time()
-        urgency = max(0.0, 1.0 - time_until_needed / self.prediction_horizon)
-        priority = prediction.probability * urgency * prediction.confidence
-        
-        # Schedule the transfer
-        self._schedule_transfer(
-            chunk_id=chunk_id,
-            source=current_location,
-            destination=target_location,
-            priority=priority,
-            reason=f"Predictive: {prediction.access_pattern} (p={prediction.probability:.2f})",
-            deadline=prediction.expected_time,
-            is_prefetch=True
-        )
-    
-    def _process_transfer_queue(self):
-        """Process the transfer queue with bandwidth awareness"""
-        with self.lock:
-            # Sort queue by priority and deadline
-            self.transfer_queue.sort(key=lambda t: (-t.priority, t.deadline))
-            
-            # Calculate available bandwidth
-            available_bandwidth = self._estimate_available_bandwidth()
-            
-            # Execute transfers up to bandwidth limit
-            active_bandwidth = 0.0
-            transfers_to_execute = []
-            
-            for transfer in self.transfer_queue:
-                if len(transfers_to_execute) >= self.max_concurrent_transfers:
-                    break
-                
-                if active_bandwidth + transfer.bandwidth_requirement <= available_bandwidth:
-                    transfers_to_execute.append(transfer)
-                    active_bandwidth += transfer.bandwidth_requirement
-            
-            # Execute selected transfers
-            for transfer in transfers_to_execute:
-                if self._is_transfer_valid(transfer):
-                    self._execute_transfer(transfer)
-                    self.transfer_queue.remove(transfer)
-    
-    def _estimate_available_bandwidth(self) -> float:
-        """Estimate available bandwidth for transfers"""
-        if not self.bandwidth_measurements:
-            return 10.0  # Default 10 GB/s
-        
-        # Use recent bandwidth measurements
-        recent_measurements = list(self.bandwidth_measurements)[-5:]
-        avg_bandwidth = np.mean([m['bandwidth'] for m in recent_measurements])
-        
-        # Reserve some bandwidth for other operations
-        available_bandwidth = avg_bandwidth * self.bandwidth_threshold
-        
-        return max(1.0, available_bandwidth)  # Minimum 1 GB/s
-    
-    def _is_transfer_valid(self, transfer: TransferOperation) -> bool:
-        """Check if a transfer operation is still valid"""
-        # Check if chunk still exists in source location
-        if transfer.source == "gpu":
-            if transfer.chunk_id not in self.kv_cache_manager.gpu_cache:
-                return False
-        else:
-            if transfer.chunk_id not in self.kv_cache_manager.cpu_cache:
-                return False
-        
-        # Check if destination has space
-        if transfer.destination == "gpu":
-            if len(self.kv_cache_manager.gpu_cache) >= self.kv_cache_manager.max_gpu_chunks:
-                return False
-        else:
-            if len(self.kv_cache_manager.cpu_cache) >= self.kv_cache_manager.max_cpu_chunks:
-                return False
-        
-        return True
-    
-    def _execute_transfer(self, transfer: TransferOperation):
-        """Execute a transfer operation"""
-        start_time = time.time()
-        
-        try:
-            # Mark transfer as active
-            self.active_transfers.add(transfer.chunk_id)
-            
-            # Perform the transfer
-            if transfer.source == "gpu" and transfer.destination == "cpu":
-                self._transfer_gpu_to_cpu(transfer)
-                self.metrics.gpu_to_cpu_transfers += 1
-            elif transfer.source == "cpu" and transfer.destination == "gpu":
-                self._transfer_cpu_to_gpu(transfer)
-                self.metrics.cpu_to_gpu_transfers += 1
-            
-            # Record transfer completion
-            transfer_time = time.time() - start_time
-            self.transfer_history.append({
-                "chunk_id": transfer.chunk_id,
-                "source": transfer.source,
-                "destination": transfer.destination,
-                "transfer_time": transfer_time,
-                "reason": transfer.reason,
-                "is_prefetch": transfer.is_prefetch,
-                "timestamp": start_time
-            })
-            
-            # Update metrics
-            self.metrics.total_transfers += 1
-            if transfer.is_prefetch:
-                self.metrics.prefetch_transfers += 1
-            
-            self._update_average_transfer_time(transfer_time)
-            
-            # Update access pattern history
-            self._update_access_pattern(transfer.chunk_id, start_time)
-            
-            logger.info(f"Transfer completed: {transfer.chunk_id} {transfer.source}->{transfer.destination} "
-                       f"({transfer_time:.3f}s, prefetch: {transfer.is_prefetch})")
-            
-        except Exception as e:
-            logger.error(f"Transfer failed for {transfer.chunk_id}: {e}")
-        finally:
-            # Remove from active transfers
-            self.active_transfers.discard(transfer.chunk_id)
-    
-    def _transfer_gpu_to_cpu(self, transfer: TransferOperation):
-        """Transfer a chunk from GPU to CPU"""
-        entry = self.kv_cache_manager.gpu_cache[transfer.chunk_id]
-        
-        # Move to CPU
-        entry.keys = entry.keys.cpu()
-        entry.values = entry.values.cpu()
-        entry.metadata.is_on_gpu = False
-        
-        # Update cache
-        self.kv_cache_manager.cpu_cache[transfer.chunk_id] = entry
-        self.kv_cache_manager.gpu_memory_used -= entry.metadata.size_bytes
-        self.kv_cache_manager.cpu_memory_used += entry.metadata.size_bytes
-        
-        # Remove from GPU cache
-        del self.kv_cache_manager.gpu_cache[transfer.chunk_id]
-    
-    def _transfer_cpu_to_gpu(self, transfer: TransferOperation):
-        """Transfer a chunk from CPU to GPU"""
-        entry = self.kv_cache_manager.cpu_cache[transfer.chunk_id]
-        
-        # Move to GPU
-        entry.keys = entry.keys.to(self.device)
-        entry.values = entry.values.to(self.device)
-        entry.metadata.is_on_gpu = True
-        
-        # Update cache
-        self.kv_cache_manager.gpu_cache[transfer.chunk_id] = entry
-        self.kv_cache_manager.gpu_memory_used += entry.metadata.size_bytes
-        self.kv_cache_manager.cpu_memory_used -= entry.metadata.size_bytes
-        
-        # Remove from CPU cache
-        del self.kv_cache_manager.cpu_cache[transfer.chunk_id]
-    
-    def _update_access_pattern(self, chunk_id: str, access_time: float):
-        """Update access pattern history for a chunk"""
-        self.access_pattern_history[chunk_id].append({
-            'timestamp': access_time,
-            'type': 'transfer'
-        })
-    
-    def _adapt_scheduler_parameters(self):
-        """Adaptively adjust scheduler parameters based on performance"""
-        if len(self.prediction_history) < 10:
-            return
-        
-        # Calculate prediction accuracy
-        recent_predictions = list(self.prediction_history)[-10:]
-        correct_predictions = 0
-        total_predictions = 0
-        
-        for pred_record in recent_predictions:
-            for pred in pred_record['predictions']:
-                if pred.expected_time > 0:
-                    total_predictions += 1
-                    # Check if prediction was accurate (within 0.5 seconds)
-                    actual_access = self._find_actual_access_time(pred.chunk_id, pred_record['timestamp'])
-                    if actual_access and abs(actual_access - pred.expected_time) < 0.5:
-                        correct_predictions += 1
-        
-        if total_predictions > 0:
-            accuracy = correct_predictions / total_predictions
-            self.metrics.prediction_accuracy = accuracy
-            
-            # Adjust prefetch aggressiveness based on accuracy
-            if accuracy > 0.8:
-                self.prefetch_aggressiveness = min(1.0, self.prefetch_aggressiveness + 0.05)
-            elif accuracy < 0.5:
-                self.prefetch_aggressiveness = max(0.3, self.prefetch_aggressiveness - 0.05)
-    
-    def _find_actual_access_time(self, chunk_id: str, prediction_time: float) -> Optional[float]:
-        """Find when a chunk was actually accessed after prediction"""
-        # Look for actual access in transfer history
-        for record in self.transfer_history:
-            if (record['chunk_id'] == chunk_id and 
-                record['timestamp'] > prediction_time and
-                record['destination'] == 'gpu'):
-                return record['timestamp']
-        return None
-    
-    def _calculate_adaptive_sleep(self) -> float:
-        """Calculate adaptive sleep interval based on system activity"""
-        if len(self.transfer_history) < 5:
-            return 0.1  # Default interval
-        
-        # Adjust sleep based on transfer frequency
-        recent_transfers = [t for t in self.transfer_history 
-                           if time.time() - t['timestamp'] < 10.0]
-        
-        if len(recent_transfers) > 10:
-            return 0.05  # High activity - shorter sleep
-        elif len(recent_transfers) < 3:
-            return 0.2   # Low activity - longer sleep
-        else:
-            return 0.1   # Normal activity - default sleep
-    
-    def _get_chunk_entry(self, chunk_id: str):
-        """Get chunk entry from either GPU or CPU cache"""
-        if chunk_id in self.kv_cache_manager.gpu_cache:
-            return self.kv_cache_manager.gpu_cache[chunk_id]
-        elif chunk_id in self.kv_cache_manager.cpu_cache:
-            return self.kv_cache_manager.cpu_cache[chunk_id]
-        return None
-    
-    def _get_chunk_location(self, chunk_id: str) -> str:
-        """Get current location of a chunk"""
-        if chunk_id in self.kv_cache_manager.gpu_cache:
-            return "gpu"
-        elif chunk_id in self.kv_cache_manager.cpu_cache:
-            return "cpu"
-        return "unknown"
-    
-    def _schedule_transfer(self, chunk_id: str, source: str, destination: str, 
-                          priority: float, reason: str, deadline: float, is_prefetch: bool = False):
-        """Schedule a transfer operation"""
-        # Get chunk size
-        entry = self._get_chunk_entry(chunk_id)
-        if not entry:
-            return
-        
-        # Calculate bandwidth requirement (simplified)
-        size_gb = entry.metadata.size_bytes / (1024**3)
-        estimated_time = size_gb / 5.0  # Assume 5 GB/s transfer rate
-        bandwidth_requirement = size_gb / estimated_time
-        
-        # Create transfer operation
-        transfer_op = TransferOperation(
-            chunk_id=chunk_id,
-            source=source,
-            destination=destination,
-            priority=priority,
-            estimated_transfer_time=estimated_time,
-            size_bytes=entry.metadata.size_bytes,
-            reason=reason,
-            deadline=deadline,
-            bandwidth_requirement=bandwidth_requirement,
-            is_prefetch=is_prefetch
-        )
-        
-        # Add to queue if not already scheduled
-        with self.lock:
-            # Check if already in queue
-            for existing_op in self.transfer_queue:
-                if existing_op.chunk_id == chunk_id:
-                    # Update existing operation if new one has higher priority
-                    if priority > existing_op.priority:
-                        self.transfer_queue.remove(existing_op)
-                        heapq.heappush(self.transfer_queue, transfer_op)
-                    return
-            
-            heapq.heappush(self.transfer_queue, transfer_op)
-            logger.debug(f"Scheduled transfer: {chunk_id} {source}->{destination} "
-                        f"(priority: {priority:.3f}, prefetch: {is_prefetch})")
-    
-    def _update_average_transfer_time(self, new_time: float):
-        """Update average transfer time"""
-        if self.metrics.total_transfers == 1:
-            self.metrics.average_transfer_time = new_time
-        else:
-            # Exponential moving average
-            alpha = 0.1
-            self.metrics.average_transfer_time = (
-                alpha * new_time + (1 - alpha) * self.metrics.average_transfer_time
-            )
-    
-    def update_cache_hit_rate(self, hit_rate: float):
-        """Update cache hit rate metric"""
-        self.metrics.cache_hit_rate = hit_rate
-    
-    def get_scheduler_stats(self) -> Dict[str, Any]:
-        """Get comprehensive scheduler statistics"""
-        return {
-            "metrics": self.metrics.__dict__,
-            "queue_size": len(self.transfer_queue),
-            "active_transfers": len(self.active_transfers),
-            "recent_transfers": list(self.transfer_history)[-10:],
-            "gpu_chunks": len(self.kv_cache_manager.gpu_cache),
-            "cpu_chunks": len(self.kv_cache_manager.cpu_cache),
-            "gpu_memory_used_gb": self.kv_cache_manager.gpu_memory_used / (1024**3),
-            "cpu_memory_used_gb": self.kv_cache_manager.cpu_memory_used / (1024**3),
-            "adaptive_parameters": {
-                "prefetch_aggressiveness": self.prefetch_aggressiveness,
-                "eviction_threshold": self.eviction_threshold,
-                "temporal_weight": self.temporal_weight
-            },
-            "system_state": {
-                "memory_pressure": self.memory_pressure_history[-1]['pressure'] if self.memory_pressure_history else 0.0,
-                "available_bandwidth": self._estimate_available_bandwidth()
-            }
-        }
-    
-    def stop(self):
-        """Stop the scheduler"""
-        self.running = False
-        if self.scheduler_thread:
-            self.scheduler_thread.join(timeout=5.0)
-        logger.info("Adaptive Temporal Scheduler stopped")
-    
-    def clear_queue(self):
-        """Clear the transfer queue"""
-        with self.lock:
-            self.transfer_queue.clear()
-        logger.info("Transfer queue cleared")
-    
-    def force_transfer(self, chunk_id: str, destination: str, priority: float = 1.0):
-        """Force a transfer operation with high priority"""
-        current_location = self._get_chunk_location(chunk_id)
-        if current_location != destination:
-            self._schedule_transfer(
-                chunk_id=chunk_id,
-                source=current_location,
-                destination=destination,
-                priority=priority,
-                reason="Forced transfer",
-                deadline=time.time() + 1.0,
-                is_prefetch=False
-            )
 
+        payload = {"trace": out_trace}
 
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2)
+
+        return payload

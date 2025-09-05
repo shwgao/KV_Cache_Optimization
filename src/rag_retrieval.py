@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
-"""
-Unified RAGatouille indexing + top-k retrieval on a JSON dataset.
-
-- Per-sample indexing with RAGatouille (ColBERT under the hood)
-- Top-k retrieval returning indices and scores
-- Compatible with datasets that have per-sample contexts (e.g "ctxs")
-
-You can run in two phases or do both:
-  1) prepare (build per-sample index)
-  2) retrieve (compute top-k indices/scores)
-"""
-
+from __future__ import annotations
 import os
 import json
-import argparse
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 
-from tqdm import tqdm
 from ragatouille import RAGPretrainedModel
 
 
-def _ensure_list(x: Any) -> List[Any]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return x
-    return [x]
+# --------------------------- config ---------------------------
 
+@dataclass
+class RetrievalConfig:
+    # Model & dataset
+    model_id: str = "colbert-ir/colbertv2.0"
+    dataset_name: str = "pipeline_dataset"
+
+    # Key names inside each sample
+    r_text_index_key: str = "r_text_index"        # where per-sample index path is stored
+    doc_key: str = "doc_id"                        # optional, used to name per-sample index
+    question_key: str = "question"                 # text query field
+    retrieved_key: str = "retrieved_indices"       # output indices
+    page_id_key: str = "page_ids"                  # optional allow-list of page indices
+
+    # Defaults
+    top_k: int = 5
+
+
+# ---------------------- small utilities ----------------------
 
 def _extract_texts_from_sample(sample: Dict[str, Any]) -> List[str]:
-    """Extract a list of textual passages from a sample.
-    Tries common fields; falls back to empty if none.
     """
-    # Prefer MuSiQue-style ctxs
+    Extract textual passages for indexing.
+    - Prefer MuSiQue-style: sample["ctxs"] with {title, text}
+    - Fallbacks: sample["contents"] as list[str|dict]
+    """
     if isinstance(sample.get("ctxs"), list):
         texts: List[str] = []
         for ch in sample["ctxs"]:
@@ -43,9 +45,8 @@ def _extract_texts_from_sample(sample: Dict[str, Any]) -> List[str]:
                 texts.append(full.replace("\n", " "))
         return texts
 
-    # Generic fallbacks
     if isinstance(sample.get("contents"), list):
-        out = []
+        out: List[str] = []
         for it in sample["contents"]:
             if isinstance(it, str):
                 s = it.strip()
@@ -61,6 +62,7 @@ def _extract_texts_from_sample(sample: Dict[str, Any]) -> List[str]:
 
 
 def _get_hit_doc_id(hit: Dict[str, Any]) -> Optional[int]:
+    """Try common id fields returned by RAGatouille/ColBERT."""
     for key in ("passage_id", "docid", "doc_id", "document_id", "id"):
         if key in hit:
             try:
@@ -70,182 +72,164 @@ def _get_hit_doc_id(hit: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _pid_map_ok(index_path: str) -> bool:
+    """Check that per-sample index directory looks valid."""
+    if not isinstance(index_path, str) or not index_path:
+        return False
+    pid_map = os.path.join(index_path, "pid_docid_map.json")
+    return os.path.exists(pid_map)
+
+
+# --------------------- main retriever class -------------------
+
 class ColbertRetrieval:
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
+    """
+    Minimal ColBERT retriever using RAGatouille under the hood.
+
+    Typical usage from pipeline.py:
+        retr = ColbertRetrieval(RetrievalConfig(top_k=cfg.cache.max_gpu_chunks))
+        samples = retr.prepare(samples)                  # add per-sample index paths
+        samples = retr.retrieve(samples)                 # add top-k indices + scores
+        # or per-sample:
+        idxs, scores = retr.find_sample_top_k(sample, top_k=16)
+    """
+
+    def __init__(self, config: RetrievalConfig | Dict[str, Any] = RetrievalConfig()):
+        if isinstance(config, dict):
+            self.config = RetrievalConfig(**config)
+        else:
+            self.config = config
+
+        # Lazy handles to avoid repeated loads
+        self._indexer: Optional[RAGPretrainedModel] = None
+
+    # -------- public API --------
 
     def prepare(self, samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        model_id = self.config.get("model", "colbert-ir/colbertv2.0")
-        r_text_index_key = self.config.get("r_text_index_key", "r_text_index")
-        doc_key = self.config.get("doc_key", "doc_id")
-        text_question_key = self.config.get("text_question_key", "question")
-        dataset_name = self.config.get("dataset_name", "dataset")
+        """
+        Build per-sample ColBERT indices (if missing) and store the path in r_text_index_key.
+        Idempotent: skips samples that already have a valid index.
+        """
+        cfg = self.config
+        RAG = self._get_indexer()  # single shared indexer
 
-        RAG = RAGPretrainedModel.from_pretrained(model_id)
+        # Map to reuse an index if the same document key appears multiple times
+        cached_index_path_for_doc: Dict[str, str] = {}
 
-        doc_index: Dict[str, str] = {}
-        errors = 0
-
-        for sample in tqdm(samples, desc="Indexing per-sample"):
-            # Skip if index already present and path exists
-            idx_path = sample.get(r_text_index_key)
-            if isinstance(idx_path, str) and os.path.exists(os.path.join(idx_path, "pid_docid_map.json")):
+        for sample in samples:
+            # if already valid, skip
+            existing = sample.get(cfg.r_text_index_key)
+            if _pid_map_ok(existing):
                 continue
 
-            doc_val = str(sample.get(doc_key, ""))
-            if not doc_val:
-                # Use a fallback per-sample key if missing
-                doc_val = str(sample.get("id", "sample"))
+            # choose a stable per-sample name
+            doc_val = str(sample.get(cfg.doc_key, "") or sample.get("id", "sample"))
 
-            if doc_val in doc_index:
-                sample[r_text_index_key] = doc_index[doc_val]
+            if doc_val in cached_index_path_for_doc:
+                sample[cfg.r_text_index_key] = cached_index_path_for_doc[doc_val]
                 continue
 
             texts = _extract_texts_from_sample(sample)
             if not texts:
-                sample[r_text_index_key] = ""
+                sample[cfg.r_text_index_key] = ""
                 continue
 
-            index_name = f"{dataset_name}-{text_question_key}-{doc_val}"
+            index_name = f"{cfg.dataset_name}-{cfg.question_key}-{doc_val}"
             try:
                 index_path = RAG.index(index_name=index_name, collection=texts)
-                doc_index[doc_val] = index_path
-                sample[r_text_index_key] = index_path
             except Exception as e:
-                errors += 1
-                sample[r_text_index_key] = ""
-                if errors > max(1, len(samples) // 100):
-                    print("Too many error cases. Exit process.")
-                    raise
-                print(f"Error processing {doc_val}: {e}")
+                # On failure, mark empty and continue; caller can decide how to handle
+                sample[cfg.r_text_index_key] = ""
+                continue
+
+            cached_index_path_for_doc[doc_val] = index_path
+            sample[cfg.r_text_index_key] = index_path
 
         return samples
 
-    def find_sample_top_k(self, sample: Dict[str, Any], top_k: int, page_id_key: str) -> Tuple[List[int], List[float]]:
-        r_text_index_key = self.config.get("r_text_index_key", "r_text_index")
-        text_question_key = self.config.get("text_question_key", "question")
-        index_path = sample.get(r_text_index_key, "")
+    def retrieve(self, samples: List[Dict[str, Any]], top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Compute top-k page indices (+scores) for each sample.
+        Writes in-place:
+            sample[cfg.retrieved_key] = List[int]
+            sample[cfg.retrieved_key + "_score"] = List[float]
+        """
+        cfg = self.config
+        k = int(top_k or cfg.top_k)
 
-        pid_map_path = os.path.join(index_path, "pid_docid_map.json")
-        if not os.path.exists(pid_map_path):
-            print(f"Index not found for {pid_map_path}.")
+        for sample in samples:
+            idxs, scores = self.find_sample_top_k(sample, top_k=k)
+            sample[cfg.retrieved_key] = idxs
+            sample[cfg.retrieved_key + "_score"] = scores
+
+        return samples
+
+    def find_sample_top_k(self, sample: Dict[str, Any], top_k: Optional[int] = None) -> Tuple[List[int], List[float]]:
+        """
+        Return (indices, scores) for a single sample.
+        - Respects page allow-list if sample contains cfg.page_id_key.
+        - Returns [] if index not found or question missing.
+        """
+        cfg = self.config
+        k = int(top_k or cfg.top_k)
+
+        index_path = sample.get(cfg.r_text_index_key, "")
+        if not _pid_map_ok(index_path):
             return [], []
 
-        with open(pid_map_path, 'r') as f:
-            pid_map_data = json.load(f)  # { passage_id(str) : docid(int-like) }
+        # Load pid -> docid mapping
+        pid_map_path = os.path.join(index_path, "pid_docid_map.json")
+        with open(pid_map_path, "r") as f:
+            pid_map_data = json.load(f)  # { passage_id(str) : docid (int-like) }
 
-        # Build a consistent docid -> rank mapping
+        # Build docid -> rank and pid -> page
         unique_docids = list(dict.fromkeys(pid_map_data.values()))
         docid_to_rank = {val: idx for idx, val in enumerate(unique_docids)}
-        # Map passage_id -> page rank
         pid_to_page = {int(k): docid_to_rank[v] for k, v in pid_map_data.items() if str(k).isdigit()}
 
-        query = str(sample.get(text_question_key, ""))
+        query = str(sample.get(cfg.question_key, "")).strip()
         if not query:
             return [], []
 
         RAG = RAGPretrainedModel.from_index(index_path)
-        results = RAG.search(query, k=max(top_k, len(pid_to_page) or top_k))
+        results = RAG.search(query, k=max(k, len(pid_to_page) or k))
 
         top_indices: List[int] = []
         top_scores: List[float] = []
 
-        # Prefer passage_id if available, else use docid variants
         for hit in results:
             pid_or_doc = _get_hit_doc_id(hit)
             if pid_or_doc is None:
                 continue
-            idx = pid_to_page.get(pid_or_doc)
-            if idx is None:
-                # If the returned id is a docid, map via docid_to_rank
-                idx = docid_to_rank.get(pid_or_doc)
-            if idx is None:
+            page_idx = pid_to_page.get(pid_or_doc)
+            if page_idx is None:
+                # If ColBERT returns docid directly, map via docid_to_rank
+                page_idx = docid_to_rank.get(pid_or_doc)
+            if page_idx is None:
                 continue
+
             score = float(hit.get("score", 0.0))
-            top_indices.append(idx)
+            top_indices.append(page_idx)
             top_scores.append(score)
-            if len(top_indices) >= top_k:
+            if len(top_indices) >= k:
                 break
 
-        if page_id_key in sample and isinstance(sample[page_id_key], list):
-            allowed = set(int(x) for x in sample[page_id_key])
-            filtered_idx: List[int] = []
-            filtered_scores: List[float] = []
-            for idx, sc in zip(top_indices, top_scores):
-                if idx in allowed:
-                    filtered_idx.append(idx)
-                    filtered_scores.append(sc)
-            return filtered_idx[:top_k], filtered_scores[:top_k]
+        # Optional allow-list filtering (e.g., some datasets provide valid page ids)
+        if cfg.page_id_key in sample and isinstance(sample[cfg.page_id_key], list):
+            allowed = set(int(x) for x in sample[cfg.page_id_key])
+            f_idx, f_sc = [], []
+            for i, sc in zip(top_indices, top_scores):
+                if i in allowed:
+                    f_idx.append(i)
+                    f_sc.append(sc)
+            return f_idx[:k], f_sc[:k]
 
-        return top_indices[:top_k], top_scores[:top_k]
+        return top_indices[:k], top_scores[:k]
 
-    def run(self, dataset_path: str, action: str = "both") -> str:
-        # Load dataset
-        with open(dataset_path, "r") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            data = [data]
+    # -------- internals --------
 
-        # Attach dataset_name if not provided
-        if not self.config.get("dataset_name"):
-            base = os.path.splitext(os.path.basename(dataset_path))[0]
-            self.config["dataset_name"] = base
-
-        # Keys
-        r_text_index_key = self.config.get("r_text_index_key", "r_text_index")
-        r_text_key = self.config.get("r_text_key", "retrieved_indices")
-        page_id_key = self.config.get("page_id_key", "page_ids")
-        top_k = int(self.config.get("top_k", 8))
-
-        # Prepare
-        if action in ("both", "prepare"):
-            data = self.prepare(data)
-
-        # Retrieve
-        if action in ("both", "retrieve"):
-            for sample in tqdm(data, desc="Retrieving top-k"):
-                idxs, scores = self.find_sample_top_k(sample, top_k=top_k, page_id_key=page_id_key)
-                sample[r_text_key] = idxs
-                sample[r_text_key + "_score"] = scores
-
-        # Save next to dataset
-        out_path = self.config.get("out_path", dataset_path.replace('.json', f'_rag_{action}_k{top_k}.json'))
-        with open(out_path, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"Saved: {out_path}")
-        return out_path
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="Single-file RAG indexing + retrieval")
-    p.add_argument("--dataset", required=True, help="Path to dataset JSON")
-    p.add_argument("--action", choices=["prepare", "retrieve", "both"], default="both")
-    p.add_argument("--model", default="colbert-ir/colbertv2.0", help="HF model id for RAG")
-    p.add_argument("--top-k", type=int, default=8)
-    # Key names (customize per dataset)
-    p.add_argument("--doc-key", default="doc_id")
-    p.add_argument("--text-question-key", default="question")
-    p.add_argument("--r-text-index-key", default="r_text_index")
-    p.add_argument("--r-text-key", default="retrieved_indices")
-    p.add_argument("--page-id-key", default="page_ids")
-    p.add_argument("--out_path", default="")
-    args = p.parse_args()
-
-    cfg = {
-        "model": args.model,
-        "top_k": args.top_k,
-        "doc_key": args.doc_key,
-        "text_question_key": args.text_question_key,
-        "r_text_index_key": args.r_text_index_key,
-        "r_text_key": args.r_text_key,
-        "page_id_key": args.page_id_key,
-    }
-
-    runner = ColbertRetrieval(cfg)
-    runner.run(args.dataset, action=args.action)
-
-
-if __name__ == "__main__":
-    main()
-
-
+    def _get_indexer(self) -> RAGPretrainedModel:
+        """Create (once) and reuse a single pre-trained model handle for indexing."""
+        if self._indexer is None:
+            self._indexer = RAGPretrainedModel.from_pretrained(self.config.model_id)
+        return self._indexer

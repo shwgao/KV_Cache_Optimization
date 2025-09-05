@@ -1,0 +1,57 @@
+# -------- Model / Device --------
+model:
+  model_name: meta-llama/Meta-Llama-3-8B
+  device: cuda:0            # e.g., "cuda:0" or "cpu"
+  dtype: auto               # auto | bf16 | fp16 | fp32 (used by scheduler model load)
+
+# -------- Retrieval (RAGatouille / ColBERT) --------
+retrieval:
+  model_id: colbert-ir/colbertv2.0
+  dataset_name: pipeline_dataset
+  r_text_index_key: r_text_index
+  doc_key: doc_id
+  question_key: question
+  retrieved_key: retrieved_indices
+  page_id_key: page_ids
+  top_k: 5                 # top-k retrieval per sample
+
+# -------- Cache limits & memory budgets --------
+cache:
+  max_gpu_chunks: 5
+  max_cpu_chunks: 1000
+  gpu_memory_limit_gb: 40.0
+  cpu_memory_limit_gb: 100.0
+
+# -------- KV builder (prefill & placeholders) --------
+kv_builder:
+  max_samples: 0           # 0 = all
+  dump_placements: true
+  save_cache_dir: kv_caches      # relative to output dir; "" to skip saving
+  save_placeholders: false
+
+# -------- Speculative predictor --------
+speculative:
+  top_k: 5                 # initial GPU set comes from retrieval[:top_k], capped by max_gpu
+  steps: 16
+  promote_per_step: 2
+  max_gpu: 5
+  max_samples: 0           # 0 = all
+  enable_progress: false
+  out_path: speculative_next.json   # relative to output dir
+
+# -------- Scheduler (TANGO) --------
+scheduler:
+  max_gpu: 5
+  step_duration_ms: 50
+  safety_margin_ms: 30
+  max_samples: 0           # 0 = all
+  load_cache_dir: kv_caches      # directory containing on-disk KV (from kv_builder)
+  cache_filter_prefix: auto              # "auto" => f"{sample_id}_chunk"
+  load_initial_to_gpu: false             # if true, immediately promote preloaded CPU entries
+  enable_progress: false
+  out_path: scheduler/decoder_trace.json
+
+# -------- Paths (artifacts written under the main --output dir) --------
+paths:
+  retrieval_json: retrieval/rag_output.json
+  kv_summary_json: kv_build/kv_cache_summary.json
