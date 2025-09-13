@@ -84,13 +84,7 @@ def build_kv_caches_for_sample(
             )
             manager.store_chunk(entry.metadata.chunk_id, entry, priority="gpu")
         else:
-
-
-
-
-
-
-
+            continue
 
     gpu_entries = list(manager.gpu_cache.values())
     if not gpu_entries:
