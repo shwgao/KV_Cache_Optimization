@@ -84,13 +84,13 @@ def build_kv_caches_for_sample(
             )
             manager.store_chunk(entry.metadata.chunk_id, entry, priority="gpu")
         else:
-            entry = manager.create_placeholder_entry(
-                chunk_id=chunk_id,
-                text=chunk_text,
-                tokens=tokenizer.encode(chunk_text, add_special_tokens=False),
-                relevance_score=0.0,
-            )
-            manager.store_chunk(entry.metadata.chunk_id, entry, priority="cpu")
+
+
+
+
+
+
+
 
     gpu_entries = list(manager.gpu_cache.values())
     if not gpu_entries:
