@@ -235,7 +235,7 @@ def main():
             setattr(retrieval_cfg, "checkpoint", getattr(retrieval_cfg, "model_id"))
         except Exception:
             pass
-    retrieval = ColbertRetrieval(retrieval_cfg, device=device)
+    retrieval = ColbertRetrieval(retrieval_cfg)
     logging.info("Preparing retrieval indices (if needed)...")
     retrieval.prepare(samples)
     logging.info("Running retrieval...")
