@@ -126,163 +126,55 @@ def build_kv_caches_for_sample(
     return past_key_values
 
 
-#!/usr/bin/env python3
-import argparse
-import json
-import os
-import time
-import random
-from typing import Any, Dict, List, Tuple, Optional
-
-import yaml  # type: ignore
-import torch  # type: ignore
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer  # type: ignore
-
-# Local modules
-from rag_retrieval import RetrievalConfig, ColbertRetrieval  # type: ignore
-from kv_cache_manager import KVCacheManager  # type: ignore
-from build_kv_cache import _tokenize_chunk, _prefill_get_past, extract_texts  # type: ignore
-
-# ------------------------------ Logging ------------------------------
-import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-
-def load_config(path: str) -> Dict[str, Any]:
-    logging.info(f"Loading config from {path}")
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
-    logging.info("Config loaded")
-    return cfg
-
-
-def load_samples(path: str) -> List[Dict[str, Any]]:
-    logging.info(f"Loading samples from {path}")
-    with open(path, "r") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        logging.info(f"Loaded {len(data)} samples (list)")
-        return data
-    if isinstance(data, dict) and "samples" in data:
-        logging.info(f"Loaded {len(data['samples'])} samples (dict['samples'])")
-        return data["samples"]  # type: ignore
-    if isinstance(data, dict) and "results" in data:
-        logging.info(f"Loaded {len(data['results'])} samples (dict['results'])")
-        return data["results"]  # type: ignore
-    logging.info("Loaded single sample (dict)")
-    return [data]  # type: ignore
-
-
-def build_kv_caches_for_sample(
-    sample: Dict[str, Any],
-    model,
-    tokenizer,
-    device: torch.device,
-    top_k: int,
-    model_config: Dict[str, Any],
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    sample_id = sample.get("id", "sample")
-    logging.info(f"[KV Build] Sample {sample_id}: start (top_k={top_k})")
-
-    text_key_pairs: List[Tuple[int, str]] = extract_texts(sample)
-    retrieved_indices: List[int] = [int(i) for i in sample.get("retrieved_indices", [])]
-    top_set = set(retrieved_indices[:top_k]) if retrieved_indices else set()
-    logging.info(f"[KV Build] Sample {sample_id}: {len(text_key_pairs)} passages, {len(top_set)} selected for prefill")
-
-    manager = KVCacheManager(
-        model_config=model_config,
-        gpu_memory_limit_gb=100.0,
-        cpu_memory_limit_gb=100.0,
-        max_gpu_chunks=top_k,
-        max_cpu_chunks=0,
-        device=str(device),
-    )
-
-    for idx, chunk_text in text_key_pairs:
-        chunk_id = f"{sample_id}_chunk{idx}"
-        if idx in top_set:
-            inputs = _tokenize_chunk(tokenizer, chunk_text, device)
-            outputs = _prefill_get_past(model, inputs)
-            entry = manager.create_kv_cache_entry(
-                chunk_id=chunk_id,
-                text=chunk_text,
-                tokens=tokenizer.encode(chunk_text, add_special_tokens=False),
-                relevance_score=1.0,
-                model_outputs=outputs,
-            )
-            manager.store_chunk(entry.metadata.chunk_id, entry, priority="gpu")
-        else:
-            continue
-
-    gpu_entries = list(manager.gpu_cache.values())
-    if not gpu_entries:
-        logging.warning(f"[KV Build] Sample {sample_id}: no GPU entries found")
-        return []
-
-    first_k = gpu_entries[0].keys  # [L, S, H, D]
-    num_layers = first_k.shape[0]
-    num_heads = first_k.shape[2]
-    head_dim = first_k.shape[3]
-
-    merged_k = [[] for _ in range(num_layers)]  # type: ignore
-    merged_v = [[] for _ in range(num_layers)]  # type: ignore
-    for entry in gpu_entries:
-        k = entry.keys.to(device)  # [L, S, H, D]
-        v = entry.values.to(device)
-        for l in range(num_layers):
-            merged_k[l].append(k[l])  # [S, H, D]
-            merged_v[l].append(v[l])
-
-    past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    total_seq_per_layer = []
-    for l in range(num_layers):
-        if merged_k[l]:
-            cat_k = torch.cat(merged_k[l], dim=0)  # [total_S, H, D]
-            cat_v = torch.cat(merged_v[l], dim=0)
-            total_seq_per_layer.append(cat_k.shape[0])
-            cat_k = cat_k.permute(1, 0, 2).unsqueeze(0)  # [1, H, total_S, D]
-            cat_v = cat_v.permute(1, 0, 2).unsqueeze(0)
-            past_key_values.append((cat_k, cat_v))
-        else:
-            empty_k = torch.empty((1, num_heads, 0, head_dim), device=device)
-            empty_v = torch.empty((1, num_heads, 0, head_dim), device=device)
-            past_key_values.append((empty_k, empty_v))
-            total_seq_per_layer.append(0)
-
-    logging.info(f"[KV Build] Sample {sample_id}: built past_key_values "
-                 f"(avg_total_seq={sum(total_seq_per_layer)/len(total_seq_per_layer):.1f})")
-    return past_key_values
-
-
 def decode_with_past(
     model,
     tokenizer,
     past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
     sample: Dict[str, Any],
-    max_new_tokens: int) -> Dict[str, Any]:
+    max_new_tokens: int,
+) -> Dict[str, Any]:
         device = next(model.parameters()).device
-        question = sample.get("question", "").strip()
+        question = (sample.get("question") or "").strip()
         sample_id = sample.get("id", "sample")
         logging.info(f"[Decode] Sample {sample_id}: start decode (max_new_tokens={max_new_tokens})")
     
+        # Tiny suffix prompt (at least 1 token)
         suffix = f"Question: {question}\nAnswer:"
-        input_ids = tokenizer(suffix, return_tensors="pt").input_ids.to(device)
+        input_ids = tokenizer(suffix, return_tensors="pt", add_special_tokens=True).input_ids.to(device)
+        if input_ids.shape[1] == 0:
+            bos = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
+            input_ids = torch.tensor([[bos]], device=device)
+    
+        # PKV must be tuple-of-tuples with shape [1, H, S, D] per layer
+        pkv = tuple((k.contiguous(), v.contiguous()) for (k, v) in past_key_values)
+        # cached prefix length S
+        cached_len = pkv[0][0].shape[2] if len(pkv) > 0 else 0
+    
+        # Attention mask over cached prefix + new tokens
+        attn_len = cached_len + input_ids.shape[1]
+        attention_mask = torch.ones((1, attn_len), dtype=torch.long, device=device)
+    
+        # Position ids for the new tokens must continue after cached prefix
+        position_ids = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device).unsqueeze(0)
     
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=None)
+    
         generation_kwargs = {
-            "inputs": input_ids,
-            "past_key_values": past_key_values,
+            "input_ids": input_ids,
+            "past_key_values": pkv,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
             "max_new_tokens": max_new_tokens,
             "do_sample": False,
-            "temperature": 0.0,
+            "use_cache": True,
             "streamer": streamer,
             "eos_token_id": tokenizer.eos_token_id,
-            "pad_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
         }
     
         first_token_time: Optional[float] = None
         start_time = time.perf_counter()
-        _ = torch.inference_mode()(lambda **kw: model.generate(**kw))(**generation_kwargs)  # sync call
+        _ = torch.inference_mode()(lambda **kw: model.generate(**kw))(**generation_kwargs)
         output_chunks: List[str] = []
         for chunk in streamer:
             if first_token_time is None:
@@ -290,19 +182,16 @@ def decode_with_past(
             output_chunks.append(chunk)
         end_time = time.perf_counter()
     
-        decoded_text = streamer.text
-        new_text = decoded_text.strip()
+        text = streamer.text.strip()
         num_chunks = len(output_chunks)
-    
         ttft = (first_token_time - start_time) if first_token_time else 0.0
         e2e = end_time - start_time
-        throughput = num_chunks / e2e if e2e > 0 else 0.0
-        tpot = e2e / num_chunks if num_chunks > 0 else 0.0
+        throughput = (num_chunks / e2e) if e2e > 0 else 0.0
+        tpot = (e2e / num_chunks) if num_chunks > 0 else 0.0
     
         logging.info(f"[Decode] Sample {sample_id}: ttft={ttft:.4f}s, e2e={e2e:.4f}s, "
                      f"chunks={num_chunks}, throughput={throughput:.2f} ch/s, tpot={tpot:.4f}s/ch")
-    
-        return {"answer": new_text, "ttft": ttft, "e2e_latency": e2e, "throughput": throughput, "tpot": tpot}
+        return {"answer": text, "ttft": ttft, "e2e_latency": e2e, "throughput": throughput, "tpot": tpot}
 
 
 def main():
