@@ -237,30 +237,33 @@ def main():
     os.makedirs(os.path.dirname(retrieval_json_path), exist_ok=True)
 
     # -------- 1) RUN RETRIEVAL AND SAVE {id, retrieved_indices, retrieved_scores} --------
-    logging.info("Initializing retrieval...")
-    retrieval_cfg = RetrievalConfig(**cfg.get("retrieval", {}))  # type: ignore
-    # Keep it simple: if checkpoint missing, mirror model_id
-    if not getattr(retrieval_cfg, "checkpoint", None):
-        try:
-            setattr(retrieval_cfg, "checkpoint", getattr(retrieval_cfg, "model_id"))
-        except Exception:
-            pass
-    retrieval = ColbertRetrieval(retrieval_cfg)
-    logging.info("Preparing retrieval indices (if needed)...")
-    retrieval.prepare(samples)
-    logging.info("Running retrieval...")
-    retrieval.retrieve(samples, top_k=top_k)
-
-    retrieval_dump = []
-    for i, s in enumerate(samples):
-        retrieval_dump.append({
-            "id": s.get("id", i),
-            "retrieved_indices": s.get("retrieved_indices", []),
-            "retrieved_scores": s.get("retrieved_scores", []),
-        })
-    with open(retrieval_json_path, "w") as f:
-        json.dump(retrieval_dump, f, indent=2)
-    logging.info(f"Saved retrieval outputs to {retrieval_json_path}")
+    if os.path.isfile(retrieval_json_path):
+        logging.info(f"Retrieval JSON already exists at {retrieval_json_path}; skipping retrieval.")
+    else:
+        logging.info("Initializing retrieval...")
+        retrieval_cfg = RetrievalConfig(**cfg.get("retrieval", {}))  # type: ignore
+        # Keep it simple: if checkpoint missing, mirror model_id
+        if not getattr(retrieval_cfg, "checkpoint", None):
+            try:
+                setattr(retrieval_cfg, "checkpoint", getattr(retrieval_cfg, "model_id"))
+            except Exception:
+                pass
+        retrieval = ColbertRetrieval(retrieval_cfg)
+        logging.info("Preparing retrieval indices (if needed)...")
+        retrieval.prepare(samples)
+        logging.info("Running retrieval...")
+        retrieval.retrieve(samples, top_k=top_k)
+    
+        retrieval_dump = []
+        for i, s in enumerate(samples):
+            retrieval_dump.append({
+                "id": s.get("id", i),
+                "retrieved_indices": s.get("retrieved_indices", []),
+                "retrieved_scores": s.get("retrieved_scores", []),
+            })
+        with open(retrieval_json_path, "w") as f:
+            json.dump(retrieval_dump, f, indent=2)
+        logging.info(f"Saved retrieval outputs to {retrieval_json_path}")
 
     # -------- 2) LOAD THE SAME retrieval_topk.json AND ATTACH TO SAMPLES --------
     logging.info(f"Reloading retrieval from {retrieval_json_path} and attaching to samples...")
