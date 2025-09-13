@@ -146,24 +146,18 @@ def decode_with_past(
             input_ids = torch.tensor([[bos]], device=device)
     
         # PKV must be tuple-of-tuples with shape [1, H, S, D] per layer
-        pkv = tuple((k.contiguous(), v.contiguous()) for (k, v) in past_key_values)
+        pkv = tuple((k.contiguous(), v.contiguous()) for (k, v) in past_key_values) if past_key_values else None
+        
         # cached prefix length S
-        cached_len = pkv[0][0].shape[2] if len(pkv) > 0 else 0
+        cached_len = pkv[0][0].shape[2] if pkv and len(pkv) > 0 else 0
+        
+        logging.info(f"[Decode] Sample {sample_id}: cached_len={cached_len}, input_ids.shape={input_ids.shape}")
     
-        # Attention mask over cached prefix + new tokens
-        attn_len = cached_len + input_ids.shape[1]
-        attention_mask = torch.ones((1, attn_len), dtype=torch.long, device=device)
-    
-        # Position ids for the new tokens must continue after cached prefix
-        position_ids = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device).unsqueeze(0)
-    
+        # Create streamer
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=None)
     
         generation_kwargs = {
             "input_ids": input_ids,
-            "past_key_values": pkv,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
             "max_new_tokens": max_new_tokens,
             "do_sample": False,
             "use_cache": True,
@@ -171,10 +165,32 @@ def decode_with_past(
             "eos_token_id": tokenizer.eos_token_id,
             "pad_token_id": tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
         }
+        
+        # Only add past_key_values and related parameters if we actually have cached KV
+        if pkv and cached_len > 0:
+            # Attention mask over cached prefix + new tokens
+            attn_len = cached_len + input_ids.shape[1]
+            attention_mask = torch.ones((1, attn_len), dtype=torch.long, device=device)
+            
+            # Position ids for the new tokens must continue after cached prefix
+            position_ids = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device).unsqueeze(0)
+            
+            generation_kwargs.update({
+                "past_key_values": pkv,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            })
+            logging.info(f"[Decode] Sample {sample_id}: Using cached KV with attention_mask.shape={attention_mask.shape}")
+        else:
+            logging.info(f"[Decode] Sample {sample_id}: No cached KV, using standard generation")
     
         first_token_time: Optional[float] = None
         start_time = time.perf_counter()
-        _ = torch.inference_mode()(lambda **kw: model.generate(**kw))(**generation_kwargs)
+        
+        # Use inference_mode context manager properly
+        with torch.inference_mode():
+            _ = model.generate(**generation_kwargs)
+        
         output_chunks: List[str] = []
         for chunk in streamer:
             if first_token_time is None:
@@ -192,7 +208,6 @@ def decode_with_past(
         logging.info(f"[Decode] Sample {sample_id}: ttft={ttft:.4f}s, e2e={e2e:.4f}s, "
                      f"chunks={num_chunks}, throughput={throughput:.2f} ch/s, tpot={tpot:.4f}s/ch")
         return {"answer": text, "ttft": ttft, "e2e_latency": e2e, "throughput": throughput, "tpot": tpot}
-
 
 def main():
     parser = argparse.ArgumentParser(description="Full KV reuse baseline")
