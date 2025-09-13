@@ -536,6 +536,17 @@ def main():
             prefix_prompt = getattr(fuser, "_cb_prefix_prompt", "")
             query_prompt  = getattr(fuser, "_cb_query_prompt", "")
 
+            cb_save_dir = os.path.join(args.output, "results/pipeline/cb_kv_cache", f"sample{si+1}")
+            os.makedirs(cb_save_dir, exist_ok=True)
+            # (re)build fuser with save path (or set fuser.save_cache_dir = cb_save_dir)
+            fuser = CacheBlendFuser(
+                model_id=model_id,
+                gpu_mem_util=cfg["model"].get("gpu_mem_util", 0.5),
+                save_cache_dir=cb_save_dir,  # <-- this makes collect() persist per-chunk KVs
+            )
+            fuser._cb_prefix_prompt = prefix_prompt
+            fuser._cb_query_prompt  = query_prompt
+
             # tokenize chunks/question with required sentinels
             doc_chunk_ids, q_ids, meta = build_chunk_ids(
                 fuser.tokenizer,
@@ -544,10 +555,9 @@ def main():
                 prefix_prompt=prefix_prompt,
             )
 
-            # 3) Collect fused KVs (prefill without decoding)
-            _ = fuser.collect(doc_chunk_ids, meta)
-
-            # 4) Decode with fused cache
+            # 3) Collect fused KVs (prefill w/o decoding) + SAVE per-chunk KVs to cb_save_dir
+            fuser.collect(doc_chunk_ids, meta, sample_id=str(sample.get("id", f"sample{si}")))
+            # 4) Decode with fused cache (optional, keeps current behavior)
             input_ids = fuser.stitch_input_ids(doc_chunk_ids, meta)
             out = fuser.decode_with_fused(
                 input_ids,

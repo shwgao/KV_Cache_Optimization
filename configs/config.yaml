@@ -1,6 +1,6 @@
 # -------- Model / Device --------
 model:
-  model_name: meta-llama/Meta-Llama-3-8B
+  model_name: mistralai/Mistral-7B-Instruct-v0.2
   device: cuda:0         
   dtype: auto 
   gpu_mem_util: 0.5
