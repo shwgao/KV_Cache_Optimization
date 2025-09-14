@@ -331,10 +331,35 @@ def main() -> None:
                 }
             )
 
-    results_path = os.path.join(args.output, "results.json")
+    # Compute average metrics across all results.  We include all entries,
+    # including those with zero metrics (e.g. errors), to give an overall
+    # picture of performance.  If you prefer to ignore failed entries, filter
+    # them out below.
+    if results:
+        total_ttft = sum(res.get("ttft", 0.0) for res in results)
+        total_e2e = sum(res.get("e2e_latency", 0.0) for res in results)
+        total_throughput = sum(res.get("throughput", 0.0) for res in results)
+        total_tpot = sum(res.get("tpot", 0.0) for res in results)
+        n = len(results)
+        avg_ttft = total_ttft / n
+        avg_e2e = total_e2e / n
+        avg_throughput = total_throughput / n
+        avg_tpot = total_tpot / n
+        # Append a summary entry to the results list.
+        results.append({
+            "sample_id": "average",
+            "answer": "average_metrics",
+            "ttft": avg_ttft,
+            "e2e_latency": avg_e2e,
+            "throughput": avg_throughput,
+            "tpot": avg_tpot,
+            "accuracy": None,
+        })
+
+    results_path = os.path.join(args.output, "results_1.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"Completed processing {len(results)} samples. Results saved to {results_path}")
+    print(f"Completed processing {len(results) - 1} samples. Results saved to {results_path}")
 
 
 if __name__ == "__main__":
