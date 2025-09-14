@@ -43,12 +43,6 @@ def build_kv_caches_for_sample(
     top_k: int,
     model_config: Dict[str, Any],
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """
-    Build KV caches for the top‑k retrieved passages of a sample.  If no passages
-    are selected for prefill, an empty list is returned.  The returned cache
-    follows the legacy tuple‑of‑tuples format expected by Hugging Face's
-    generation API.
-    """
     text_key_pairs: List[Tuple[int, str]] = extract_texts(sample)
     retrieved_indices: List[int] = [int(i) for i in sample.get("retrieved_indices", [])]
     top_set = set(retrieved_indices[:top_k]) if retrieved_indices else set()
@@ -129,18 +123,10 @@ def decode_with_past(
     sample: Dict[str, Any],
     max_new_tokens: int,
 ) -> Dict[str, Any]:
-    """
-    Generate an answer using an existing KV cache.  To avoid an
-    `IndexError: index -1 is out of bounds for dimension 0` when passing
-    `past_key_values` into `model.generate`, this function computes and supplies
-    a valid `cache_position` tensor alongside the attention mask and position
-    ids.  The cache position marks the absolute positions of the new input
-    tokens relative to the cached context【909521447714667†L187-L193】.
-    """
     device = next(model.parameters()).device
     question = (sample.get("question") or "").strip()
     # Construct a simple prompt.  If a chat template is required for your model
-    # (e.g. Meta‑Llama‑3‑8B‑Instruct), apply it here instead of using a raw
+    # (e.g Meta‑Llama‑3‑8B‑Instruct), apply it here instead of using a raw
     # suffix.  The tokenizer may return zero tokens if the template strips
     # everything, so fall back to a BOS token when necessary.
     suffix = f"Question: {question}\nAnswer:"
@@ -173,13 +159,8 @@ def decode_with_past(
         # Build a full attention mask covering cached tokens and new input tokens.
         total_len = cached_len + input_ids.shape[1]
         attention_mask = torch.ones((1, total_len), dtype=torch.long, device=device)
-        # Position ids for RoPE/positional embeddings start after the cached
-        # sequence.  Note: position_ids is optional for Llama, but we supply it
-        # here for completeness.
+        
         position_ids = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device, dtype=torch.long).unsqueeze(0)
-        # Cache position marks the absolute indices of the new input tokens.
-        # It is a 1D tensor of length equal to the number of new tokens and
-        # starts at `cached_len`【909521447714667†L187-L193】.
         cache_position = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device, dtype=torch.long)
         # Convert past_key_values to the legacy tuple format expected by generate.
         pkv_tuple = tuple((k.contiguous(), v.contiguous()) for k, v in past_key_values)
@@ -331,10 +312,6 @@ def main() -> None:
                 }
             )
 
-    # Compute average metrics across all results.  We include all entries,
-    # including those with zero metrics (e.g. errors), to give an overall
-    # picture of performance.  If you prefer to ignore failed entries, filter
-    # them out below.
     if results:
         total_ttft = sum(res.get("ttft", 0.0) for res in results)
         total_e2e = sum(res.get("e2e_latency", 0.0) for res in results)
