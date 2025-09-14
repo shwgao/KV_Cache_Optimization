@@ -16,7 +16,7 @@ OUTPUT="results/full_kv_reuse_results"
 
 mkdir -p "$OUTPUT"
 
-"$PYTHON" "src/full_kv_reuse_v1.py" \
+"$PYTHON" "src/full_kv_reuse.py" \
   --config "$CONFIG" \
   --input "$INPUT" \
   --output "$OUTPUT" \
