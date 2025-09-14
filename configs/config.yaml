@@ -1,6 +1,6 @@
 # -------- Model / Device --------
 model:
-  model_name: meta-llama/Meta-Llama-3-8B
+  model_name: mistralai/Mistral-7B-Instruct-v0.2
   device: cuda:0         
   dtype: auto 
   gpu_mem_util: 0.5
@@ -19,7 +19,7 @@ retrieval:
 # -------- Prefill Mode --------
 # Choose ONE of: full_kv_reuse | cb_fuse | recompute
 prefill:
-  mode: cb_fuse        
+  mode: full_kv_reuse      
   cb:                        
     prefix_prompt: >
       You will be asked a question after reading several passages.
