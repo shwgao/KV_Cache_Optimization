@@ -8,7 +8,7 @@ from pathlib import Path
 
 eval_dataset = load_dataset("inputs/musique_s.json")
 
-llm = LLM(model="mistralai/Mistral-7B-Instruct-v0.2", gpu_memory_utilization=0.5,
+llm = LLM(model="mistralai/Mistral-7B-Instruct-v0.2", gpu_memory_utilization=0.8, dtype=torch.float16, enforce_eager=True,
           #tokenizer=tokenizer,
           )
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
@@ -22,7 +22,14 @@ ttft_full = []
 f1_blend = []
 f1_full = []
 
+max_run = 10
+run_idx = 0
+
 for ex in eval_dataset:
+    run_idx += 1
+    if run_idx > max_run:
+        break
+    
     answers = ex["answers"]
     doc_prompts, q_prompt = build_qa_prompt(ex, query_prompt)
     doc_chunk_ids = [tokenizer.encode(doc)[1:] for doc in doc_prompts]
