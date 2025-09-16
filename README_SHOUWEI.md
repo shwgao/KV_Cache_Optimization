@@ -48,3 +48,36 @@
         cache_k.append(llm_layers[j].self_attn.hack_kv[0])
         cache_v.append(llm_layers[j].self_attn.hack_kv[1])
     ```
+
+## Pipeline Logic Problems
+1. Don't need `retriever` during prefill stage, because we need to compute full kv cache for all chunks.
+    ```python
+    # The part and the related should be removed.
+    retriever = None
+    if maybe_existing is None:
+        rconf = RetrievalConfig(
+            model_id=cfg["retrieval"]["model_id"],
+            dataset_name=cfg["retrieval"]["dataset_name"],
+            r_text_index_key=cfg["retrieval"]["r_text_index_key"],
+            doc_key=cfg["retrieval"]["doc_key"],
+            question_key=cfg["retrieval"]["question_key"],
+            retrieved_key=cfg["retrieval"]["retrieved_key"],
+            page_id_key=cfg["retrieval"]["page_id_key"],
+            top_k=int(cfg["retrieval"]["top_k"]),
+        )
+        retriever = ColbertRetrieval(rconf)
+    ```
+
+2. Make sure we should use top-k chunks for prefill?
+
+4. The fourth step speculative prediction is useless, as you put all decoding logic in the `scheduler.run`.
+
+5. The `scheduler.run` is too heavy for every step, as you need to compute scores for all chunks and decide which chunks to promote or evict. You need to make sure the TOP is as good as regular decoding. I am thinking the 
+
+6. If the speculative decoding is needed, then it should be combined within the `Scheduler`. However, I highly recommend you to reconstruct the `Scheduler`. It's better to split the model running, speculative predicting and KV cache scheduler to three different classes. Also multiprocessing is also recommended. 
+
+7. Use async to prefetch and evict the KV cache.
+
+8. For the `scheduler.run`, the logic of your implementation is not correct. No actual token generated for every step, which I am suppose you want to generate one token per step. 
+
+9. Make sure only compute part of attention for the chunks is correct, as I didn't see the how to compute the output in your `scheduler.run`.
