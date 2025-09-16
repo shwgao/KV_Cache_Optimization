@@ -1,22 +1,29 @@
+#!/usr/bin/env python3
 import argparse
 import json
 import os
 import time
-import random
 from typing import Any, Dict, List, Tuple, Optional
 
-import yaml  # type: ignore
-import torch  # type: ignore
+import yaml
+import torch
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TextIteratorStreamer,
 )
 
+# If you have your ColBERT wrapper, keep these; otherwise stub them out.
 from rag_retrieval import RetrievalConfig, ColbertRetrieval  # type: ignore
-from kv_cache_manager import KVCacheManager  # type: ignore
-from build_kv_cache import _tokenize_chunk, _prefill_get_past, extract_texts  # type: ignore
 
+# Optional: if you already have this helper; otherwise we fall back below.
+try:
+    from build_kv_cache import extract_texts  # type: ignore
+except Exception:
+    extract_texts = None  # we'll use a fallback extractor
+
+
+# ---------------------------- utils ----------------------------
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r") as f:
@@ -35,308 +42,333 @@ def load_samples(path: str) -> List[Dict[str, Any]]:
     return [data]  # type: ignore
 
 
-def build_kv_caches_for_sample(
-    sample: Dict[str, Any],
+def fallback_extract_texts(sample: Dict[str, Any]) -> List[Tuple[int, str]]:
+    """
+    Try common fields if build_kv_cache.extract_texts is unavailable.
+    Expected formats:
+      - sample["retrieved"] = [{"idx": int, "text": str}, ...]
+      - sample["retrieved_texts"] & sample["retrieved_indices"]
+      - sample["passages"] = [{"id": int, "content": str}, ...]
+    """
+    out: List[Tuple[int, str]] = []
+    if isinstance(sample.get("retrieved"), list):
+        for it in sample["retrieved"]:
+            idx = int(it.get("idx", len(out)))
+            txt = str(it.get("text", "")).strip()
+            if txt:
+                out.append((idx, txt))
+        return out
+    if sample.get("retrieved_texts") and sample.get("retrieved_indices"):
+        for idx, txt in zip(sample["retrieved_indices"], sample["retrieved_texts"]):
+            if txt:
+                out.append((int(idx), str(txt)))
+        return out
+    if isinstance(sample.get("passages"), list):
+        for it in sample["passages"]:
+            idx = int(it.get("id", len(out)))
+            txt = str(it.get("content", "")).strip()
+            if txt:
+                out.append((idx, txt))
+        return out
+    # fallback: if the sample has a "context" string, treat it as a single chunk
+    ctx = str(sample.get("context", "")).strip()
+    if ctx:
+        out.append((0, ctx))
+    return out
+
+
+def ensure_pad_token(tokenizer):
+    if tokenizer.pad_token is None:
+        # most causal LMs are fine using EOS as PAD
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+# ----------------------- retrieval wrapper ----------------------
+
+def run_retrieval(samples: List[Dict[str, Any]], cfg: Dict[str, Any], top_k: int) -> None:
+    """
+    Run ColBERT retrieval and attach 'retrieved_indices' (and optionally texts)
+    to each sample in-place.
+    """
+    rconf = RetrievalConfig(**cfg.get("retrieval", {}))
+    if not getattr(rconf, "checkpoint", None):
+        rconf.checkpoint = getattr(rconf, "model_id", "colbert-ir/colbertv2.0")
+    retriever = ColbertRetrieval(rconf)
+    retriever.prepare(samples)
+    retriever.retrieve(samples, top_k=top_k)
+
+
+# --------------------- KV prefill (one pass) --------------------
+
+def prefill_topk_kv(
     model,
     tokenizer,
     device: torch.device,
+    sample: Dict[str, Any],
     top_k: int,
-    model_config: Dict[str, Any],
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    text_key_pairs: List[Tuple[int, str]] = extract_texts(sample)
+) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], int]:
+    """
+    Build past_key_values for the *concatenation* of the top-k retrieved chunks
+    in a single forward pass (correct RoPE). Returns (past_key_values, cached_len).
+
+    cached_len is the total number of prompt tokens contributed by the chunks.
+    """
+    # 1) pick top-k indices (if present), and extract chunk texts (idx, text)
     retrieved_indices: List[int] = [int(i) for i in sample.get("retrieved_indices", [])]
-    top_set = set(retrieved_indices[:top_k]) if retrieved_indices else set()
+    top_set = set(retrieved_indices[:top_k]) if retrieved_indices else None
 
-    if not top_set:
-        return []
+    pairs: List[Tuple[int, str]]
+    if extract_texts is not None:
+        pairs = extract_texts(sample)  # type: ignore
+    else:
+        pairs = fallback_extract_texts(sample)
 
-    # Initialize the KV cache manager.  This helper stores per‑chunk caches on
-    # GPU for fast retrieval.
-    manager = KVCacheManager(
-        model_config=model_config,
-        gpu_memory_limit_gb=100.0,
-        cpu_memory_limit_gb=100.0,
-        max_gpu_chunks=top_k,
-        max_cpu_chunks=0,
-        device=str(device),
-    )
+    if not pairs:
+        return [], 0
 
-    gpu_entries = []
-    for idx, chunk_text in text_key_pairs:
-        if idx in top_set:
-            chunk_id = f"{sample.get('id', 'sample')}_chunk{idx}"
-            try:
-                inputs = _tokenize_chunk(tokenizer, chunk_text, device)
-                outputs = _prefill_get_past(model, inputs)
-                entry = manager.create_kv_cache_entry(
-                    chunk_id=chunk_id,
-                    text=chunk_text,
-                    tokens=tokenizer.encode(chunk_text, add_special_tokens=False),
-                    relevance_score=1.0,
-                    model_outputs=outputs,
-                )
-                manager.store_chunk(entry.metadata.chunk_id, entry, priority="gpu")
-                gpu_entries.append(entry)
-            except Exception:
-                continue
+    # 2) order as in retrieved_indices when available; otherwise keep given order
+    ordered_chunks: List[str] = []
+    if top_set is not None:
+        # keep only those in top_set, in retrieved_indices order
+        idx_to_text = {i: t for i, t in pairs}
+        for i in retrieved_indices:
+            if i in top_set and i in idx_to_text and idx_to_text[i]:
+                ordered_chunks.append(idx_to_text[i])
+        # If we didn't find any text (e.g., retrieval-only indices), bail out
+        if not ordered_chunks:
+            return [], 0
+    else:
+        # take the first top_k texts as they appear
+        ordered_chunks = [t for _, t in pairs[:top_k] if t]
 
-    if not gpu_entries:
-        return []
+    # 3) tokenize concatenating with a separator to reduce accidental merges
+    sep_ids: List[int] = []
+    if tokenizer.eos_token_id is not None:
+        sep_ids = [tokenizer.eos_token_id]
+    elif hasattr(tokenizer, "encode"):
+        sep_ids = tokenizer.encode("\n\n", add_special_tokens=False)
 
-    # Determine the number of layers, heads and head dim from the first entry.
-    first_k = gpu_entries[0].keys
-    num_layers = first_k.shape[0]
-    num_heads = first_k.shape[2]
-    head_dim = first_k.shape[3]
+    concat_ids: List[int] = []
+    for j, text in enumerate(ordered_chunks):
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        concat_ids.extend(ids)
+        if j != len(ordered_chunks) - 1 and sep_ids:
+            concat_ids.extend(sep_ids)
 
-    # Merge caches across layers by concatenating the sequence dimension.
-    merged_k: List[List[torch.Tensor]] = [[] for _ in range(num_layers)]
-    merged_v: List[List[torch.Tensor]] = [[] for _ in range(num_layers)]
-    for entry in gpu_entries:
-        k = entry.keys.to(device)
-        v = entry.values.to(device)
-        for l in range(num_layers):
-            merged_k[l].append(k[l])
-            merged_v[l].append(v[l])
+    if not concat_ids:
+        return [], 0
 
-    past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    for l in range(num_layers):
-        if merged_k[l]:
-            cat_k = torch.cat(merged_k[l], dim=0)
-            cat_v = torch.cat(merged_v[l], dim=0)
-            # Reshape to expected format: [batch, heads, seq, head_dim]
-            cat_k = cat_k.permute(1, 0, 2).unsqueeze(0)
-            cat_v = cat_v.permute(1, 0, 2).unsqueeze(0)
-            past_key_values.append((cat_k, cat_v))
-        else:
-            empty_k = torch.empty((1, num_heads, 0, head_dim), device=device, dtype=torch.float16)
-            empty_v = torch.empty((1, num_heads, 0, head_dim), device=device, dtype=torch.float16)
-            past_key_values.append((empty_k, empty_v))
+    input_ids = torch.tensor([concat_ids], device=device)
+    with torch.inference_mode():
+        out = model(input_ids=input_ids, use_cache=True)
 
-    return past_key_values
+    # out.past_key_values: list of L tuples (k, v) with shape [b, h, s, d]
+    pkv: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    for (k, v) in out.past_key_values:  # type: ignore[attr-defined]
+        pkv.append((k.contiguous(), v.contiguous()))
+
+    cached_len = input_ids.shape[1]
+    return pkv, cached_len
+
+
+# ------------------- decode with streaming TTFT -----------------
+
+def format_user_prompt(tokenizer, question: str) -> torch.Tensor:
+    """Use chat template when available; otherwise a plain QA suffix."""
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        messages = [{"role": "user", "content": question}]
+        ids = tokenizer.apply_chat_template(
+            messages, return_tensors="pt", add_generation_prompt=True
+        )
+        return ids
+    # fallback
+    suffix = f"Question: {question}\nAnswer:"
+    ids = tokenizer(suffix, return_tensors="pt", add_special_tokens=True).input_ids
+    return ids
 
 
 def decode_with_past(
     model,
     tokenizer,
-    past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    pkv: List[Tuple[torch.Tensor, torch.Tensor]],
+    cached_len: int,
     sample: Dict[str, Any],
     max_new_tokens: int,
 ) -> Dict[str, Any]:
-    device = next(model.parameters()).device
+    """
+    Streamed generation with proper TTFT:
+      - generation runs in a background thread,
+      - we consume TextIteratorStreamer concurrently.
+    """
     question = (sample.get("question") or "").strip()
-    # Construct a simple prompt.  If a chat template is required for your model
-    # (e.g Meta‑Llama‑3‑8B‑Instruct), apply it here instead of using a raw
-    # suffix.  The tokenizer may return zero tokens if the template strips
-    # everything, so fall back to a BOS token when necessary.
-    suffix = f"Question: {question}\nAnswer:"
-    inputs = tokenizer(suffix, return_tensors="pt", add_special_tokens=True)
-    input_ids = inputs.input_ids.to(device)
-    if input_ids.shape[1] == 0:
-        bos_token = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
-        input_ids = torch.tensor([[bos_token]], device=device)
+    input_ids = format_user_prompt(tokenizer, question).to(device)
 
-    # Determine if we have any cached tokens and their maximum length.  Some
-    # layers may be empty if no passages were prefetched, so take the maximum
-    # sequence length across all layers.
-    has_cached_kv = past_key_values and any(kv[0].shape[2] > 0 for kv in past_key_values)
-    if has_cached_kv:
-        cached_len = max(kv[0].shape[2] for kv in past_key_values)
-    else:
-        cached_len = 0
+    # Create attention mask to avoid pad token warnings
+    attention_mask = torch.ones_like(input_ids)
+    
+    generation_kwargs = dict(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        temperature=1.0,
+        use_cache=True,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
-    generation_kwargs = {
-        "input_ids": input_ids,
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "temperature": 1.0,
-        "use_cache": True,
-        "eos_token_id": tokenizer.eos_token_id,
-        "pad_token_id": tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-    }
-
-    if has_cached_kv:
-        # Build a full attention mask covering cached tokens and new input tokens.
-        total_len = cached_len + input_ids.shape[1]
-        attention_mask = torch.ones((1, total_len), dtype=torch.long, device=device)
+    # attach past_key_values + positions so we don't recompute prefill
+    if pkv and any(k.shape[2] > 0 for (k, _) in pkv):
+        # position ids start after cached_len
+        pos = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device).unsqueeze(0)
+        generation_kwargs["past_key_values"] = tuple((k.contiguous(), v.contiguous()) for (k, v) in pkv)
+        generation_kwargs["position_ids"] = pos
         
-        position_ids = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device, dtype=torch.long).unsqueeze(0)
-        cache_position = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device, dtype=torch.long)
-        # Convert past_key_values to the legacy tuple format expected by generate.
-        pkv_tuple = tuple((k.contiguous(), v.contiguous()) for k, v in past_key_values)
-        generation_kwargs.update(
-            {
-                "past_key_values": pkv_tuple,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "cache_position": cache_position,
-            }
-        )
-    # Streaming setup
+        # Extend attention mask to include cached tokens
+        cached_attention_mask = torch.ones(input_ids.shape[0], cached_len, device=device, dtype=attention_mask.dtype)
+        generation_kwargs["attention_mask"] = torch.cat([cached_attention_mask, attention_mask], dim=1)
+        
+        # some models accept cache_position; guard it and ensure it's not empty
+        if "cache_position" in model.generate.__code__.co_varnames:
+            cache_pos = torch.arange(cached_len, cached_len + input_ids.shape[1], device=device)
+            if cache_pos.numel() > 0:  # Only set if not empty
+                generation_kwargs["cache_position"] = cache_pos
+
+    # streaming
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     generation_kwargs["streamer"] = streamer
 
-    # Trigger generation
-    first_token_time: Optional[float] = None
-    start_time = time.perf_counter()
-    try:
-        with torch.inference_mode():
-            model.generate(**generation_kwargs)
-    except Exception as e:
-        return {
-            "answer": f"Generation failed: {str(e)}",
-            "ttft": 0.0,
-            "e2e_latency": 0.0,
-            "throughput": 0.0,
-            "tpot": 0.0,
-        }
+    first_tok_t: Optional[float] = None
+    t0 = time.perf_counter()
 
-    output_chunks: List[str] = []
+    # background generation
+    import threading
+    th = threading.Thread(target=lambda: model.generate(**generation_kwargs), daemon=True)
+    th.start()
+
+    pieces: List[str] = []
     try:
-        for chunk in streamer:
-            if first_token_time is None:
-                first_token_time = time.perf_counter()
-            output_chunks.append(chunk)
+        for text in streamer:
+            if first_tok_t is None:
+                first_tok_t = time.perf_counter()
+            pieces.append(text)
+    finally:
+        th.join()
+
+    t1 = time.perf_counter()
+    gen_text = "".join(pieces).strip()
+
+    # token count based on tokenizer (strings != tokens)
+    try:
+        gen_ids = tokenizer.encode(gen_text, add_special_tokens=False)
+        num_toks = len(gen_ids)
     except Exception:
-        pass
+        num_toks = max(1, len(pieces))
 
-    end_time = time.perf_counter()
-    generated_text = "".join(output_chunks).strip()
-    num_tokens = len(output_chunks)
-    ttft = (first_token_time - start_time) if first_token_time else 0.0
-    e2e_latency = end_time - start_time
-    throughput = (num_tokens / e2e_latency) if e2e_latency > 0 else 0.0
-    tpot = (e2e_latency / num_tokens) if num_tokens > 0 else 0.0
+    e2e = t1 - t0
+    ttft = (first_tok_t - t0) if first_tok_t else 0.0
+    throughput = (num_toks / e2e) if e2e > 0 else 0.0
+    tpot = (e2e / num_toks) if num_toks > 0 else 0.0
 
     return {
-        "answer": generated_text,
+        "answer": gen_text,
         "ttft": ttft,
-        "e2e_latency": e2e_latency,
+        "e2e_latency": e2e,
         "throughput": throughput,
         "tpot": tpot,
     }
 
 
-def run_retrieval(samples: List[Dict[str, Any]], cfg: Dict[str, Any], top_k: int) -> None:
-    """Run ColBERT retrieval and attach results to samples."""
-    retrieval_cfg = RetrievalConfig(**cfg.get("retrieval", {}))
-    if not hasattr(retrieval_cfg, "checkpoint") or not retrieval_cfg.checkpoint:
-        retrieval_cfg.checkpoint = getattr(retrieval_cfg, "model_id", "colbert-ir/colbertv2.0")
-    retrieval = ColbertRetrieval(retrieval_cfg)
-    retrieval.prepare(samples)
-    retrieval.retrieve(samples, top_k=top_k)
-
+# ------------------------------ main ---------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Full KV reuse baseline (fixed)")
-    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to config.yaml")
-    parser.add_argument("--input", type=str, default="inputs/musique_s.json", help="Path to input dataset JSON")
-    parser.add_argument("--output", type=str, default="results/full_kv_reuse_results", help="Directory to write results")
-    parser.add_argument("--top_k", type=int, default=5, help="Number of passages to prefill and reuse")
-    parser.add_argument("--retrieval_json", type=str, default="retrieval_topk.json", help="Retrieval JSON filename")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser("Full KV Reuse (corrected)")
+    ap.add_argument("--config", type=str, default="configs/config.yaml")
+    ap.add_argument("--input", type=str, default="inputs/musique_s.json")
+    ap.add_argument("--output", type=str, default="results/full_kv_reuse_results")
+    ap.add_argument("--top_k", type=int, default=5)
+    ap.add_argument("--retrieval_json", type=str, default="retrieval_topk.json")
+    args = ap.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
     cfg = load_config(args.config)
     samples = load_samples(args.input)
 
-    model_name = cfg.get("model", {}).get("model_name", "meta-llama/Meta-Llama-3-8B")
-    device_name = cfg.get("model", {}).get("device", "cuda:0")
+    model_name = cfg.get("model", {}).get("model_name", "meta-llama/Meta-Llama-3-8B-Instruct")
+    device_pref = cfg.get("model", {}).get("device", "cuda:0")
     top_k = cfg.get("retrieval", {}).get("top_k", args.top_k)
-    max_new_tokens = cfg.get("prefill", {}).get("query_prompt", {}).get("max_new_tokens", 32)
+    max_new_tokens = cfg.get("generation", {}).get("max_new_tokens", 128)
 
-    device = torch.device(device_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # model + tok
+    tokenizer = ensure_pad_token(AutoTokenizer.from_pretrained(model_name))
+    # Prefer a single explicit device unless you know you want sharding
+    device = torch.device(device_pref) if torch.cuda.is_available() else torch.device("cpu")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        device_map="auto" if "cuda" in device_name else None,
-    )
-    model.eval()
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map=None,  # keep on one device for simpler PKV plumbing
+    ).to(device).eval()
 
-    # Handle retrieval results: load existing or run retrieval
+    # ------ retrieval cache or run ------
     retrieval_json_path = os.path.join(args.output, args.retrieval_json)
     if os.path.exists(retrieval_json_path):
         with open(retrieval_json_path, "r") as f:
             retrieval_data = json.load(f)
-        retrieval_by_id: Dict[str, Any] = {}
-        if isinstance(retrieval_data, list):
-            for item in retrieval_data:
-                retrieval_by_id[str(item.get("id", ""))] = item
-        for i, sample in enumerate(samples):
-            sample_id = str(sample.get("id", i))
-            if sample_id in retrieval_by_id:
-                sample.update(retrieval_by_id[sample_id])
+        by_id = {str(it.get("id", i)): it for i, it in enumerate(retrieval_data)}
+        for i, smp in enumerate(samples):
+            sid = str(smp.get("id", i))
+            if sid in by_id:
+                smp.update(by_id[sid])
     else:
         run_retrieval(samples, cfg, top_k)
-        retrieval_results = []
-        for sample in samples:
-            retrieval_results.append(
-                {
-                    "id": sample.get("id"),
-                    "retrieved_indices": sample.get("retrieved_indices", []),
-                    "retrieved_scores": sample.get("retrieved_scores", []),
-                }
-            )
+        to_save = []
+        for smp in samples:
+            to_save.append({
+                "id": smp.get("id"),
+                "retrieved_indices": smp.get("retrieved_indices", []),
+                "retrieved_scores": smp.get("retrieved_scores", []),
+            })
         with open(retrieval_json_path, "w") as f:
-            json.dump(retrieval_results, f, indent=2)
+            json.dump(to_save, f, indent=2)
 
-    model_config = {
-        "hidden_size": getattr(model.config, "hidden_size", 4096),
-        "num_layers": getattr(model.config, "num_hidden_layers", 32),
-        "num_attention_heads": getattr(model.config, "num_attention_heads", 32),
-        "head_dim": getattr(model.config, "hidden_size", 4096) // getattr(model.config, "num_attention_heads", 32),
-        "vocab_size": getattr(model.config, "vocab_size", tokenizer.vocab_size),
-    }
-
-    results = []
-    for idx, sample in enumerate(samples):
-        sample_id = sample.get("id", str(idx))
+    # ------ per-sample run ------
+    results: List[Dict[str, Any]] = []
+    for i, sample in enumerate(samples):
+        sid = sample.get("id", str(i))
         try:
-            past_key_values = build_kv_caches_for_sample(sample, model, tokenizer, device, top_k, model_config)
-            decode_result = decode_with_past(model, tokenizer, past_key_values, sample, max_new_tokens)
-            decode_result.update({"sample_id": sample_id, "accuracy": round(random.random(), 3)})
-            results.append(decode_result)
+            pkv, cached_len = prefill_topk_kv(model, tokenizer, device, sample, top_k)
+            out = decode_with_past(model, tokenizer, device, pkv, cached_len, sample, max_new_tokens)
+            out.update({"sample_id": sid})
         except Exception as e:
-            results.append(
-                {
-                    "sample_id": sample_id,
-                    "answer": f"Error: {str(e)}",
-                    "ttft": 0.0,
-                    "e2e_latency": 0.0,
-                    "throughput": 0.0,
-                    "tpot": 0.0,
-                    "accuracy": 0.0,
-                }
-            )
+            out = {
+                "sample_id": sid,
+                "answer": f"Error: {e}",
+                "ttft": 0.0,
+                "e2e_latency": 0.0,
+                "throughput": 0.0,
+                "tpot": 0.0,
+            }
+        results.append(out)
 
+    # ------ summary row ------
     if results:
-        total_ttft = sum(res.get("ttft", 0.0) for res in results)
-        total_e2e = sum(res.get("e2e_latency", 0.0) for res in results)
-        total_throughput = sum(res.get("throughput", 0.0) for res in results)
-        total_tpot = sum(res.get("tpot", 0.0) for res in results)
         n = len(results)
-        avg_ttft = total_ttft / n
-        avg_e2e = total_e2e / n
-        avg_throughput = total_throughput / n
-        avg_tpot = total_tpot / n
-        # Append a summary entry to the results list.
+        avg = lambda k: sum(r.get(k, 0.0) for r in results) / max(1, n)
         results.append({
             "sample_id": "average",
             "answer": "average_metrics",
-            "ttft": avg_ttft,
-            "e2e_latency": avg_e2e,
-            "throughput": avg_throughput,
-            "tpot": avg_tpot,
-            "accuracy": None,
+            "ttft": avg("ttft"),
+            "e2e_latency": avg("e2e_latency"),
+            "throughput": avg("throughput"),
+            "tpot": avg("tpot"),
         })
 
-    results_path = os.path.join(args.output, "results_1.json")
-    with open(results_path, "w") as f:
+    out_path = os.path.join(args.output, "results_full_kv_reuse.json")
+    with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"Completed processing {len(results) - 1} samples. Results saved to {results_path}")
+    print(f"Done: {len(results)-1} samples → {out_path}")
 
 
 if __name__ == "__main__":
