@@ -14,8 +14,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStream
 
 # --- local modules ---
 from rag_retrieval import RetrievalConfig, ColbertRetrieval
-from build_kv_cache import KVCachesBuilder
-from speculative_decoding import SpeculativeChunkPredictor
+from build_kv_cache import KVCachesBuilder, _tokenize_chunk, _prefill_get_past
 from scheduler import TangoScheduler
 
 
@@ -233,15 +232,80 @@ def _load_and_merge_kvs(
     return past
 
 
+def _merge_kvs_from_manager(
+    manager,
+    indices: List[int],
+    device: torch.device,
+    model_dtype: torch.dtype,
+) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Merge in-memory K/V tensors for selected indices from a KVCacheManager.
+    Returns HF-compatible past_key_values or None if missing.
+    """
+    if not indices:
+        return None
+    merged_k: List[List[torch.Tensor]] = []
+    merged_v: List[List[torch.Tensor]] = []
+    num_layers = None
+
+    for idx in indices:
+        cid = None
+        # infer sample id from any one entry in cache
+        # here we scan both caches
+        # expected chunk id pattern: "{sample_id}_chunk{idx}"
+        for pool in (manager.gpu_cache, manager.cpu_cache):
+            for key in pool.keys():
+                if key.endswith(f"_chunk{idx}"):
+                    cid = key
+                    break
+            if cid:
+                break
+        if cid is None:
+            continue
+        entry = manager.gpu_cache.get(cid) or manager.cpu_cache.get(cid)
+        if entry is None:
+            continue
+        k = entry.keys
+        v = entry.values
+        # Normalize to [L,1,H,S,D] like the disk path
+        if k.ndim == 4 and v.ndim == 4:
+            # entry layout is [L,S,H,D] per KVCacheManager -> permute to [L,H,S,D] and add batch
+            k = k.permute(0, 2, 1, 3).unsqueeze(1)
+            v = v.permute(0, 2, 1, 3).unsqueeze(1)
+        elif k.ndim == 5 and v.ndim == 5:
+            # already [L,B,H,S,D]
+            pass
+        if num_layers is None:
+            num_layers = k.shape[0]
+            merged_k = [[] for _ in range(num_layers)]
+            merged_v = [[] for _ in range(num_layers)]
+        for L in range(num_layers):
+            merged_k[L].append(k[L, 0])  # [H,S,D]
+            merged_v[L].append(v[L, 0])
+
+    if num_layers is None:
+        return None
+
+    past: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    for L in range(num_layers):
+        if not merged_k[L]:
+            return None
+        k_cat = torch.cat(merged_k[L], dim=1).unsqueeze(0).to(device=device, dtype=model_dtype)
+        v_cat = torch.cat(merged_v[L], dim=1).unsqueeze(0).to(device=device, dtype=model_dtype)
+        past.append((k_cat, v_cat))
+    return past
+
+
 class FinalDecoder:
     """Minimal decoder wrapper to stream text and measure latency metrics."""
 
-    def __init__(self, model_id: str, device: str):
+    def __init__(self, model_id: str, device: str, provided_tokenizer: Optional[Any] = None, provided_model: Optional[Any] = None):
         self.device = torch.device(device)
-        self.tok = AutoTokenizer.from_pretrained(model_id)
-        if self.tok.pad_token is None and self.tok.eos_token is not None:
+        # Reuse provided tokenizer/model if available to avoid reloading per sample
+        self.tok = provided_tokenizer if provided_tokenizer is not None else AutoTokenizer.from_pretrained(model_id)
+        if self.tok.pad_token is None and getattr(self.tok, "eos_token", None) is not None:
             self.tok.pad_token = self.tok.eos_token
-        self.mdl = AutoModelForCausalLM.from_pretrained(model_id).to(self.device).eval()
+        self.mdl = provided_model if provided_model is not None else AutoModelForCausalLM.from_pretrained(model_id)
+        self.mdl = self.mdl.to(self.device).eval()
 
     def _stream_generate(self, gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Run `generate` on a background thread and consume a TextIteratorStreamer."""
@@ -286,12 +350,14 @@ class FinalDecoder:
     ) -> Dict[str, Any]:
         """Decode `Answer:` given a question suffix, optionally with past KV."""
         suffix = f"Question: {question_text}\nAnswer:"
-        enc = self.tok([suffix], return_tensors="pt", padding=False, truncation=False)
+        enc = self.tok([suffix], return_tensors="pt", padding=True, truncation=False)
         input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc.get("attention_mask", torch.ones_like(input_ids)).to(self.device)
 
         streamer = TextIteratorStreamer(self.tok, skip_prompt=True, skip_special_tokens=True)
         gen_kwargs: Dict[str, Any] = dict(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             use_cache=True,
@@ -377,9 +443,15 @@ def main():
         retriever = ColbertRetrieval(rconf)
 
     kv_builder = KVCachesBuilder()
-    predictor = SpeculativeChunkPredictor()
     scheduler = TangoScheduler()
-    decoder = FinalDecoder(model_id=model_id, device=device)
+
+    # Instantiate shared tokenizer/model once and reuse across stages
+    shared_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if shared_tokenizer.pad_token is None and getattr(shared_tokenizer, "eos_token", None) is not None:
+        shared_tokenizer.pad_token = shared_tokenizer.eos_token
+    shared_model = AutoModelForCausalLM.from_pretrained(model_id).to(torch.device(device)).eval()
+
+    decoder = FinalDecoder(model_id=model_id, device=device, provided_tokenizer=shared_tokenizer, provided_model=shared_model)
 
     aggregated_kv: List[Dict[str, Any]] = []
     pred_trace_all: List[Dict[str, Any]] = []
@@ -402,7 +474,7 @@ def main():
             samples[si] = sample
             _write_json(retrieval_json_path, samples)
 
-        # 2) KV Cache Build: only top‑k keep real K/V; others placeholders
+        # 2) KV Cache Build: only top‑k keep real K/V; others placeholders (no disk save)
         sample_dir = os.path.join(kv_root, f"sample{si+1}")
         os.makedirs(sample_dir, exist_ok=True)
 
@@ -416,56 +488,42 @@ def main():
             max_cpu_chunks=int(cfg["cache"]["max_cpu_chunks"]),
             gpu_mem_gb=float(cfg["cache"]["gpu_memory_limit_gb"]),
             cpu_mem_gb=float(cfg["cache"]["cpu_memory_limit_gb"]),
-            dump_placements=bool(cfg["kv_builder"].get("dump_placements", False)),
-            save_cache_dir=sample_dir,
-            save_placeholders=True,  # placeholders for non‑top‑k
+            dump_placements=False,
+            save_cache_dir="",
+            save_placeholders=False,
             retrieval_json_path=retrieval_json_path if os.path.exists(retrieval_json_path) else "",
+            provided_tokenizer=shared_tokenizer,
+            provided_model=shared_model,
+            defer_save=True,
         )
 
-        _restructure_kv_cache_dir_to_numeric(sample_dir, expected_sample_id=str(sample_id), logger=logger)
-
-        # --- NEW: Cut non‑top‑k K/V files so only top‑k are materialized now ---
+        # Build top‑k index list
         topk_indices = _topk_indices_from_sample(sample, cfg)
-        _prune_non_topk_kv_files(sample_dir, topk_indices, logger)
 
-        aggregated_kv.append({"sample_index": si, **kv_payload})
-        _write_json(kv_summary_path, {"per_sample": aggregated_kv, "kv_root": kv_root})
+        aggregated_kv.append({"sample_index": si, **{k: v for k, v in kv_payload.items() if k != "_manager"}})
+        _write_json(kv_summary_path, {"per_sample": aggregated_kv})
 
         # Start set on GPU = **top‑k only**
         gpu_indices_initial = sorted(set(int(i) for i in topk_indices))
 
         # 3) Initial decoding (with current GPU set)
-        past_init = _load_and_merge_kvs(sample_dir, gpu_indices_initial, decoder.device, next(decoder.mdl.parameters()).dtype)
+        # Prefer in-memory KV from manager to avoid any disk I/O
+        manager = kv_payload.get("_manager")
+        if manager is not None:
+            past_init = _merge_kvs_from_manager(manager, gpu_indices_initial, decoder.device, next(decoder.mdl.parameters()).dtype)
+        else:
+            past_init = _load_and_merge_kvs(sample_dir, gpu_indices_initial, decoder.device, next(decoder.mdl.parameters()).dtype)
         decode_metrics_initial = decoder.decode_with_saved_kvs(
             question_text=sample.get("question", ""),
             past=past_init,
             max_new_tokens=cfg.get("generation", {}).get("max_new_tokens", 128),
         )
 
-        # 4) Speculative prediction (propose future chunks needed)
-        pred_payload = predictor.predict(
-            samples=[sample],
-            model_id=model_id,
-            device=device,
-            top_k=int(cfg["speculative"]["top_k"]),
-            steps=int(cfg["speculative"]["steps"]),
-            promote_per_step=int(cfg["speculative"]["promote_per_step"]),
-            max_gpu=int(cfg["speculative"]["max_gpu"]),
-            max_samples=1,
-            enable_progress=bool(cfg["speculative"].get("enable_progress", False)),
-            out_path=None,
-        )
-        for row in pred_payload.get("trace", []):
-            row["sample_index"] = si
-        for row in pred_payload.get("results", []):
-            row["sample_index"] = si
-        pred_trace_all.extend(pred_payload.get("trace", []))
-        pred_results_all.extend(pred_payload.get("results", []))
-        _write_json(pred_out_path, {"trace": pred_trace_all, "results": pred_results_all})
+        # 4) Speculative prediction is now integrated into the scheduler
 
         # 5) Scheduler (promote/evict across CPU/GPU)
         sched_payload = scheduler.run(
-            pred_payload=pred_payload,
+            pred_payload={},
             retr_samples=[sample],
             model_id=model_id,
             device=device,
@@ -474,11 +532,15 @@ def main():
             step_duration_ms=int(cfg["scheduler"]["step_duration_ms"]),
             safety_margin_ms=int(cfg["scheduler"]["safety_margin_ms"]),
             max_samples=1,
-            load_cache_dir=sample_dir,
-            cache_filter_prefix="",              # numeric subdirs
-            load_initial_to_gpu=True,            # **ensure** initial top‑k stays on GPU
+            load_cache_dir="",                  # no disk I/O
+            cache_filter_prefix="auto",
+            load_initial_to_gpu=True,
             out_path=None,
             enable_progress=bool(cfg["scheduler"].get("enable_progress", False)),
+            provided_tokenizer=shared_tokenizer,
+            provided_model=shared_model,
+            steps=int(cfg["scheduler"].get("steps", cfg["speculative"].get("steps", 16))),
+            promote_per_step=int(cfg["scheduler"].get("promote_per_step", cfg["speculative"].get("promote_per_step", 2))),
         )
         for row in sched_payload.get("trace", []):
             row["sample_index"] = si
@@ -487,7 +549,10 @@ def main():
 
         # 6) Final decoding with scheduled GPU set (seeded by our initial top‑k)
         final_gpu_indices = _compute_final_gpu_indices(gpu_indices_initial, sched_payload)
-        past_final = _load_and_merge_kvs(sample_dir, final_gpu_indices, decoder.device, next(decoder.mdl.parameters()).dtype)
+        if manager is not None:
+            past_final = _merge_kvs_from_manager(manager, final_gpu_indices, decoder.device, next(decoder.mdl.parameters()).dtype)
+        else:
+            past_final = _load_and_merge_kvs(sample_dir, final_gpu_indices, decoder.device, next(decoder.mdl.parameters()).dtype)
         decode_metrics_final = decoder.decode_with_saved_kvs(
             question_text=sample.get("question", ""),
             past=past_final,

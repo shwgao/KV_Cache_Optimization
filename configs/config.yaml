@@ -14,7 +14,7 @@ retrieval:
   question_key: question
   retrieved_key: retrieved_indices
   page_id_key: page_ids
-  top_k: 5                 # top-k retrieval per sample
+  top_k: 1                 # top-k retrieval per sample
 
 # -------- Prefill Mode --------
 # Choose ONE of: full_kv_reuse | cb_fuse | recompute
@@ -42,14 +42,13 @@ cache:
 # -------- KV builder (prefill & placeholders) --------
 kv_builder:
   max_samples: 0           # 0 = all
-  dump_placements: true
-  save_cache_dir: kv_caches      
+  dump_placements: true   
   save_placeholders: false
 
 # -------- Speculative predictor --------
 speculative:
-  top_k: 5                
-  steps: 16
+  top_k: 1                
+  steps: 5
   promote_per_step: 2
   max_gpu: 5
   max_samples: 0           # 0 = all

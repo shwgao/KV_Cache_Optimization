@@ -150,17 +150,22 @@ class KVCachesBuilder:
         save_cache_dir: str = "",
         save_placeholders: bool = False,
         retrieval_json_path: Optional[str] = None,  # optional: for provenance in payload
+        provided_tokenizer: Optional[Any] = None,
+        provided_model: Optional[Any] = None,
+        defer_save: bool = False,
     ) -> Dict[str, Any]:
         """
         Build KV caches for the given samples and return a payload dict.
         Preserves original logic & fields, minus argparse/printing.
         """
-        # Device / model setup
+        # Device / model setup (reuse provided handles if available)
         torch_device = torch.device(device)
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer = provided_tokenizer if provided_tokenizer is not None else AutoTokenizer.from_pretrained(model_id)
+        if tokenizer.pad_token is None and getattr(tokenizer, "eos_token", None) is not None:
             tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(model_id).to(torch_device)
+        model = provided_model if provided_model is not None else AutoModelForCausalLM.from_pretrained(model_id)
+        # Ensure model is on the requested device
+        model = model.to(torch_device)
         model.eval()
 
         # Samples gating
@@ -208,8 +213,25 @@ class KVCachesBuilder:
             "elapsed_sec": time.time() - start,
         }
 
+        # Expose in-memory GPU KV for immediate use (avoid disk read for initial decode)
+        try:
+            gpu_in_memory: Dict[int, Dict[str, torch.Tensor]] = {}
+            for cid, entry in manager.gpu_cache.items():
+                idx = -1
+                if isinstance(cid, str) and "_chunk" in cid:
+                    try:
+                        idx = int(cid.split("_chunk")[1])
+                    except Exception:
+                        idx = -1
+                if idx >= 0:
+                    gpu_in_memory[idx] = {"keys": entry.keys, "values": entry.values}
+            payload["gpu_in_memory"] = gpu_in_memory
+        except Exception:
+            # Best-effort: if any error, skip exposing in-memory map
+            payload["gpu_in_memory"] = {}
+
         # Optional saving of cache entries
-        if save_cache_dir:
+        if save_cache_dir and not defer_save:
             for cid, entry in manager.gpu_cache.items():
                 _save_chunk(save_cache_dir, entry)
             if save_placeholders:
@@ -230,7 +252,24 @@ class KVCachesBuilder:
                 ],
             }
 
+        # If deferred save requested, attach manager handle for caller-side dumping
+        if defer_save:
+            payload["_manager"] = manager
+
         return payload
+
+    def dump_to_dir(
+        self,
+        manager: KVCacheManager,
+        save_cache_dir: str,
+        save_placeholders: bool = True,
+    ) -> None:
+        os.makedirs(save_cache_dir, exist_ok=True)
+        for cid, entry in manager.gpu_cache.items():
+            _save_chunk(save_cache_dir, entry)
+        if save_placeholders:
+            for cid, entry in manager.cpu_cache.items():
+                _save_chunk(save_cache_dir, entry)
 
     def build_from_retrieval_json(
         self,
