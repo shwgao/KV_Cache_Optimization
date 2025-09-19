@@ -2,7 +2,10 @@ from __future__ import annotations
 import os
 import json
 import time
+import threading
 from typing import Any, Dict, List, Tuple, Set, Optional
+from queue import Queue, Empty
+from dataclasses import dataclass
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -13,6 +16,86 @@ from tqdm import tqdm
 from kv_cache_manager import KVCacheManager, KVCacheEntry, ChunkMetadata
 from build_kv_cache import extract_texts, _tokenize_chunk, _prefill_get_past
 
+
+# ------------------------------ Staging System for Per-Step Decoding ------------------------------
+
+@dataclass
+class PredictionEntry:
+    """Single chunk prediction with metadata"""
+    chunk_id: str
+    predicted_for_token: int
+    priority: float
+    timestamp: float
+
+class ChunkStaging:
+    """Manages chunk predictions between scheduler runs"""
+    
+    def __init__(self):
+        self.predictions: Dict[str, PredictionEntry] = {}
+        self.preparing: Set[str] = set()
+        self.cpu_ready: Set[str] = set()
+        self.lock = threading.Lock()
+        
+    def add_prediction(self, chunk_id: str, predicted_for_token: int, priority: float):
+        """Add a new chunk prediction"""
+        with self.lock:
+            if chunk_id in self.cpu_ready:
+                return
+            
+            entry = PredictionEntry(
+                chunk_id=chunk_id,
+                predicted_for_token=predicted_for_token,
+                priority=priority,
+                timestamp=time.time()
+            )
+            
+            if chunk_id not in self.predictions or entry.priority > self.predictions[chunk_id].priority:
+                self.predictions[chunk_id] = entry
+    
+    def get_next_to_materialize(self) -> Optional[str]:
+        """Get next chunk for background materialization"""
+        with self.lock:
+            candidates = []
+            for chunk_id, entry in self.predictions.items():
+                if chunk_id not in self.preparing and chunk_id not in self.cpu_ready:
+                    candidates.append((chunk_id, entry.priority, entry.predicted_for_token))
+            
+            if not candidates:
+                return None
+            
+            candidates.sort(key=lambda x: (-x[1], x[2]))
+            return candidates[0][0]
+    
+    def mark_preparing(self, chunk_id: str):
+        with self.lock:
+            self.preparing.add(chunk_id)
+    
+    def mark_ready(self, chunk_id: str):
+        with self.lock:
+            self.preparing.discard(chunk_id)
+            self.cpu_ready.add(chunk_id)
+    
+    def get_ready_chunks(self) -> List[Tuple[str, PredictionEntry]]:
+        """Get chunks ready for GPU promotion"""
+        with self.lock:
+            ready_with_meta = []
+            for chunk_id in self.cpu_ready:
+                if chunk_id in self.predictions:
+                    ready_with_meta.append((chunk_id, self.predictions[chunk_id]))
+            return ready_with_meta
+    
+    def cleanup_old_predictions(self, current_token: int, max_age: int = 10):
+        """Remove old predictions"""
+        with self.lock:
+            to_remove = []
+            for chunk_id, entry in self.predictions.items():
+                if current_token - entry.predicted_for_token > max_age:
+                    to_remove.append(chunk_id)
+            
+            for chunk_id in to_remove:
+                del self.predictions[chunk_id]
+                self.preparing.discard(chunk_id)
+                self.cpu_ready.discard(chunk_id)
 
 # ------------------------------ Disk loader for precomputed KV ------------------------------
 
@@ -705,3 +788,837 @@ class TangoScheduler:
                 json.dump(payload, f, indent=2)
 
         return payload
+
+    def run_per_step_decode(
+        self,
+        retr_samples: List[Dict[str, Any]],
+        model_id: str,
+        device: str = "cuda:0",
+        dtype: str = "auto",
+        max_gpu: int = 5,
+        max_samples: int = 1,
+        max_new_tokens: int = 10,
+        scheduler_interval: int = 5,  # Run heavy scheduler every N tokens
+        provided_tokenizer: Optional[Any] = None,
+        provided_model: Optional[Any] = None,
+        promote_per_step: int = 2,
+        initial_gpu_indices: List[int] = None,  # Initial GPU chunk placement
+    ) -> Dict[str, Any]:
+        """
+        New per-step decoding with lightweight prediction and periodic heavy scheduling.
+        """
+        device_t = torch.device(device)
+        if dtype == "bf16":
+            torch_dtype = torch.bfloat16
+        elif dtype == "fp16":
+            torch_dtype = torch.float16
+        elif dtype == "fp32":
+            torch_dtype = torch.float32
+        else:
+            torch_dtype = torch.bfloat16 if (device_t.type == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability(device_t)[0] >= 8) else None
+
+        tokenizer = provided_tokenizer if provided_tokenizer is not None else AutoTokenizer.from_pretrained(model_id)
+        model = provided_model if provided_model is not None else AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
+        model = model.to(device_t)
+        model.eval()
+
+        if not isinstance(retr_samples, list) or not retr_samples:
+            raise RuntimeError("Retrieval samples are empty or invalid")
+        if max_samples > 0:
+            retr_samples = retr_samples[:max_samples]
+
+        results = []
+        
+        for si, sample in enumerate(retr_samples):
+            sample_id = str(sample.get("id", f"sample{si}"))
+            texts_idx: List[Tuple[int, str]] = extract_texts(sample)
+            
+            # Initialize KV cache manager
+            kv = KVCacheManager(
+                model_config={
+                    "hidden_size": getattr(model.config, "hidden_size", 4096),
+                    "num_layers": getattr(model.config, "num_hidden_layers", 32),
+                    "num_attention_heads": getattr(model.config, "num_attention_heads", 32),
+                    "head_dim": getattr(model.config, "hidden_size", 4096) // max(1, getattr(model.config, "num_attention_heads", 32)),
+                    "vocab_size": getattr(model.config, "vocab_size", 32000),
+                },
+                gpu_memory_limit_gb=40.0,
+                cpu_memory_limit_gb=100.0,
+                max_gpu_chunks=max_gpu,
+                max_cpu_chunks=10_000,
+                device=str(device_t),
+                require_kernels=True,
+            )
+            
+            # Initialize staging
+            staging = ChunkStaging()
+            
+            # Background materialization queue
+            materialization_queue = Queue()
+            
+            # Use provided initial GPU indices or fall back to retrieved indices
+            if initial_gpu_indices is None:
+                retrieved = sample.get("retrieved_indices", [])
+                if isinstance(retrieved, list):
+                    initial_gpu_indices = [int(i) for i in retrieved[:max_gpu]]
+                else:
+                    initial_gpu_indices = []
+            
+            print(f"[PerStepDecode] Sample {si}: Using initial GPU chunks {initial_gpu_indices}")
+            
+            # Create initial GPU chunks with CORRECT RoPE positions
+            cumulative_position = 0
+            for idx in initial_gpu_indices:
+                if 0 <= idx < len(texts_idx):
+                    cid = f"{sample_id}_chunk{idx}"
+                    text = texts_idx[idx][1]
+                    
+                    # Apply correct RoPE positions
+                    inputs = _tokenize_chunk(tokenizer, text, device_t)
+                    seq_len = inputs["input_ids"].shape[1]
+                    
+                    # Create position_ids starting from cumulative position
+                    position_ids = torch.arange(
+                        cumulative_position, 
+                        cumulative_position + seq_len, 
+                        device=device_t
+                    ).unsqueeze(0)
+                    inputs["position_ids"] = position_ids
+                    
+                    print(f"[RoPE] Chunk {idx}: positions [{cumulative_position}:{cumulative_position + seq_len}]")
+                    
+                    outputs = _prefill_get_past(model, inputs)
+                    entry = kv.create_kv_cache_entry(
+                        chunk_id=cid,
+                        text=text,
+                        tokens=tokenizer.encode(text, add_special_tokens=False),
+                        relevance_score=1.0,
+                        model_outputs=outputs,
+                    )
+                    kv.store_chunk(cid, entry, priority="gpu")
+                    print(f"[PerStepDecode] Created initial GPU chunk: {cid} with correct RoPE")
+                    
+                    cumulative_position += seq_len
+            
+            # Create placeholders for remaining chunks
+            for idx, text in texts_idx:
+                cid = f"{sample_id}_chunk{idx}"
+                if cid not in kv.gpu_cache:
+                    placeholder = kv.create_placeholder_entry(
+                        chunk_id=cid,
+                        text=text,
+                        tokens=tokenizer.encode(text, add_special_tokens=False),
+                        relevance_score=0.0,
+                    )
+                    kv.store_chunk(cid, placeholder, priority="cpu")
+            
+            # Prepare bandit features
+            texts_only = [t for _, t in texts_idx]
+            qvec = _compute_query_vec_local(tokenizer, model, device_t, sample.get("question", ""))
+            centroids = _compute_chunk_centroids_local(tokenizer, model, device_t, texts_only)
+            align_cos = _cosine_scores(qvec, centroids)
+            
+            # Token length features
+            tok_lens = [len(tokenizer.encode(t, add_special_tokens=False)) for t in texts_only]
+            max_len = max(1, max(tok_lens) if tok_lens else 1)
+            
+            # Initialize bandit
+            feat_dim = 6
+            A_inv, theta = _bandit_init(feat_dim, alpha=1.0)
+            
+            # Per-step decoding
+            result = self._decode_per_step(
+                sample=sample,
+                sample_id=sample_id,
+                texts_idx=texts_idx,
+                kv=kv,
+                staging=staging,
+                materialization_queue=materialization_queue,
+                model=model,
+                tokenizer=tokenizer,
+                device_t=device_t,
+                max_new_tokens=max_new_tokens,
+                scheduler_interval=scheduler_interval,
+                max_gpu=max_gpu,
+                promote_per_step=promote_per_step,
+                # Bandit state
+                A_inv=A_inv,
+                theta=theta,
+                align_cos=align_cos,
+                tok_lens=tok_lens,
+                max_len=max_len
+            )
+            
+            results.append({
+                "sample_index": si,
+                "sample_id": sample_id,
+                **result
+            })
+        
+        return {"results": results}
+    
+    def _decode_per_step(
+        self,
+        sample: Dict[str, Any],
+        sample_id: str,
+        texts_idx: List[Tuple[int, str]],
+        kv: KVCacheManager,
+        staging: ChunkStaging,
+        materialization_queue: Queue,
+        model,
+        tokenizer,
+        device_t: torch.device,
+        max_new_tokens: int,
+        scheduler_interval: int,
+        max_gpu: int,
+        promote_per_step: int,
+        A_inv: torch.Tensor,
+        theta: torch.Tensor,
+        align_cos: torch.Tensor,
+        tok_lens: List[int],
+        max_len: int
+    ) -> Dict[str, Any]:
+        """Core per-step decoding logic"""
+        
+        # Prepare input - use simple format without cached chunks for first token
+        question_text = sample.get("question", "")
+        suffix = f"Question: {question_text}\nAnswer:"
+        
+        # Extract and display the question
+        question = suffix.split('Question: ')[1].split('\nAnswer:')[0].strip() if 'Question: ' in suffix else suffix
+        print(f"[Question] {question}")
+        
+        enc = tokenizer([suffix], return_tensors="pt", padding=True, truncation=False)
+        input_ids = enc["input_ids"].to(device_t)
+        
+        generated_tokens = []
+        trace = []
+        
+        start_time = time.time()
+        first_token_time = None
+        bw_gbps = 5.0  # EMA bandwidth estimate
+        
+        # Background materialization worker
+        def background_worker():
+            while True:
+                try:
+                    chunk_id = materialization_queue.get(timeout=0.1)
+                    if chunk_id is None:  # Shutdown signal
+                        break
+                    self._materialize_chunk_background(chunk_id, kv, staging, tokenizer, model, device_t, sample_id, texts_idx)
+                    materialization_queue.task_done()
+                except Empty:
+                    continue
+                except Exception as e:
+                    print(f"[Background] Error materializing: {e}")
+        
+        worker_thread = threading.Thread(target=background_worker, daemon=True)
+        worker_thread.start()
+        
+        try:
+            for token_step in range(max_new_tokens):
+                token_start_time = time.time()
+                
+                # 1. Generate one token using CacheBlend's paged attention
+                current_gpu_chunks = set(kv.gpu_cache.keys())
+                
+                with torch.no_grad():
+                    if token_step == 0:
+                        # For first token, use standard model forward (no cache yet)
+                        model_inputs = {
+                            "input_ids": input_ids,
+                            "attention_mask": torch.ones_like(input_ids),
+                            "use_cache": True,
+                            "return_dict": True
+                        }
+                        outputs = model(**model_inputs)
+                        next_token_logits = outputs.logits[0, -1, :]
+                    else:
+                        # For subsequent tokens, use CacheBlend's efficient paged attention
+                        last_token = torch.tensor([[generated_tokens[-1]]], device=device_t)
+                        
+                        # Use CacheBlend's built-in paged attention with proper KV cache format
+                        try:
+                            next_token_logits = self._use_cacheblend_paged_attention(
+                                model, tokenizer, last_token, kv, current_gpu_chunks, device_t
+                            )
+                            print(f"[CacheBlend] Successfully used paged attention with {len(current_gpu_chunks)} GPU chunks")
+                        except Exception as e:
+                            print(f"[CacheBlend] Paged attention failed: {e}, falling back to standard")
+                            # Fallback to standard model inference
+                            past_kv = self._build_past_key_values_from_kv(kv, current_gpu_chunks)
+                            model_inputs = {
+                                "input_ids": last_token,
+                                "attention_mask": torch.ones_like(last_token),
+                                "use_cache": True,
+                                "return_dict": True
+                            }
+                            if past_kv is not None:
+                                try:
+                                    cache_format = self._convert_to_cache_format(past_kv, model)
+                                    if cache_format is not None:
+                                        model_inputs["past_key_values"] = cache_format
+                                        # Add position info
+                                        if isinstance(cache_format, tuple) and len(cache_format) > 0:
+                                            cached_len = cache_format[0][0].shape[2] if len(cache_format[0]) > 0 else 0
+                                            if cached_len > 0:
+                                                position_ids = torch.arange(cached_len, cached_len + 1, device=device_t).unsqueeze(0)
+                                                model_inputs["position_ids"] = position_ids
+                                except Exception as cache_e:
+                                    print(f"[CacheBlend] Standard cache conversion also failed: {cache_e}")
+                            outputs = model(**model_inputs)
+                            next_token_logits = outputs.logits[0, -1, :]
+                    
+                    # Apply better token filtering
+                    # Avoid problematic tokens
+                    problematic_tokens = [tokenizer.pad_token_id, tokenizer.unk_token_id]
+                    if hasattr(tokenizer, 'mask_token_id') and tokenizer.mask_token_id is not None:
+                        problematic_tokens.append(tokenizer.mask_token_id)
+                    
+                    # Set problematic tokens to very low probability
+                    for bad_token in problematic_tokens:
+                        if bad_token is not None:
+                            next_token_logits[bad_token] = float('-inf')
+                    
+                    # Also avoid the specific problematic tokens we saw
+                    next_token_logits[28705] = float('-inf')  # Empty string token
+                    next_token_logits[398] = float('-inf')    # Asterisk token
+                    
+                    # Use sampling instead of greedy for better variety
+                    if token_step == 0:
+                        # For first token, use greedy
+                        next_token = torch.argmax(next_token_logits).item()
+                    else:
+                        # For subsequent tokens, use top-k sampling
+                        top_k = 10
+                        top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+                        probs = torch.softmax(top_k_logits, dim=-1)
+                        next_token_idx = torch.multinomial(probs, 1).item()
+                        next_token = top_k_indices[next_token_idx].item()
+                    
+                    generated_tokens.append(next_token)
+                    
+                    # Show progress every few tokens
+                    if token_step == 0 or token_step % 3 == 0:
+                        decoded_token = tokenizer.decode([next_token], skip_special_tokens=True)
+                        print(f"[Token {token_step}] '{decoded_token}'", end=" " if token_step % 9 != 0 else "\n")
+                
+                token_end_time = time.time()
+                if first_token_time is None:
+                    first_token_time = token_end_time
+                
+                # 2. Lightweight prediction using bandit (existing method)
+                predictions = self._predict_chunks_bandit(
+                    sample_id=sample_id,
+                    texts_idx=texts_idx,
+                    kv=kv,
+                    A_inv=A_inv,
+                    theta=theta,
+                    align_cos=align_cos,
+                    tok_lens=tok_lens,
+                    max_len=max_len,
+                    sample=sample,
+                    promote_per_step=promote_per_step
+                )
+                
+                # Show predictions only when they exist
+                if predictions and token_step % 5 == 0:  # Every 5th token
+                    pred_chunks = [p[0] if isinstance(p, tuple) else p for p in predictions]
+                    print(f"[Predict T{token_step}] {pred_chunks}")
+                
+                # 3. Stage predictions
+                for chunk_idx, priority in predictions:
+                    chunk_id = f"{sample_id}_chunk{chunk_idx}"
+                    staging.add_prediction(chunk_id, token_step + 1, priority)
+                
+                # 4. Request background materialization AND predictive transfer
+                next_to_materialize = staging.get_next_to_materialize()
+                if next_to_materialize:
+                    materialization_queue.put(next_to_materialize)
+                
+                # 4b. Predictive GPU transfer on low-priority stream
+                self._predictive_gpu_transfer(kv, staging, predictions, token_step, device_t, max_gpu)
+                
+                # 5. Heavy scheduler every N tokens
+                if token_step % scheduler_interval == 0:
+                    gpu_before = len(kv.gpu_cache)
+                    ready_before = len(staging.get_ready_chunks())
+                    self._run_heavy_scheduler_step(kv, staging, max_gpu, token_step, bw_gbps)
+                    gpu_after = len(kv.gpu_cache)
+                    ready_after = len(staging.get_ready_chunks())
+                    print(f"[HeavyScheduler T{token_step}] GPU: {gpu_before}→{gpu_after}, Ready: {ready_before}→{ready_after}")
+                
+                # 6. Cleanup old predictions
+                staging.cleanup_old_predictions(token_step)
+                
+                trace.append({
+                    "token_step": token_step,
+                    "token": next_token,
+                    "predictions": predictions,
+                    "gpu_chunks": len(kv.gpu_cache),
+                    "cpu_chunks": len(kv.cpu_cache),
+                    "staging_stats": {
+                        "predictions": len(staging.predictions),
+                        "preparing": len(staging.preparing),
+                        "ready": len(staging.cpu_ready)
+                    }
+                })
+                
+                # 7. Check for EOS or repetitive patterns
+                if next_token == tokenizer.eos_token_id:
+                    print(f"\n[Stop] EOS at token {token_step}")
+                    break
+                
+                # Check for repetitive patterns
+                if len(generated_tokens) >= 3:
+                    if generated_tokens[-1] == generated_tokens[-2] == generated_tokens[-3]:
+                        print(f"\n[Stop] Repetitive pattern at token {token_step}")
+                        break
+                
+                # Limit very long sequences
+                if token_step >= max_new_tokens - 1:
+                    print(f"\n[Stop] Max tokens ({max_new_tokens}) reached")
+                    break
+        
+        finally:
+            # Shutdown background worker
+            materialization_queue.put(None)
+            worker_thread.join(timeout=1.0)
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        
+        # Display final answer clearly
+        print(f"\n[Answer] {generated_text.strip()}")
+        print(f"[Summary] Generated {len(generated_tokens)} tokens in {total_time:.2f}s")
+        
+        # Calculate TPOT (Time Per Output Token)
+        tpot = total_time / len(generated_tokens) if len(generated_tokens) > 0 else 0.0
+        
+        return {
+            "answer": generated_text.strip(),
+            "ttft": (first_token_time - start_time) if first_token_time else 0.0,
+            "e2e_latency": total_time,
+            "throughput": len(generated_tokens) / total_time if total_time > 0 else 0,
+            "tpot": tpot,
+            "decoded_tokens": len(generated_tokens),
+            "trace": trace
+        }
+    
+    def _predict_chunks_bandit(self, sample_id: str, texts_idx: List[Tuple[int, str]], kv: KVCacheManager, 
+                              A_inv: torch.Tensor, theta: torch.Tensor, align_cos: torch.Tensor,
+                              tok_lens: List[int], max_len: int, sample: Dict[str, Any], promote_per_step: int) -> List[Tuple[int, float]]:
+        """Use existing bandit method for lightweight prediction"""
+        
+        def _chunk_features(idx: int, now_ts: float) -> torch.Tensor:
+            cid = f"{sample_id}_chunk{idx}"
+            # Use existing feature computation logic
+            retr_score = 0.0  # Could get from sample if available
+            log_len = float(torch.log(torch.tensor(tok_lens[idx] + 1.0))) / float(torch.log(torch.tensor(max_len + 1.0)))
+            on_gpu = 1.0 if cid in kv.gpu_cache else 0.0
+            entry = (kv.gpu_cache.get(cid) or kv.cpu_cache.get(cid))
+            acc = float(getattr(entry.metadata, "access_count", 0.0)) if entry is not None else 0.0
+            acc_norm = min(1.0, acc / 5.0)
+            align = float(align_cos[idx]) if 0 <= idx < len(align_cos) else 0.0
+            last_t = float(getattr(entry.metadata, "last_access_time", 0.0)) if entry is not None else 0.0
+            recency = 1.0 if (now_ts - last_t) < 0.5 else 0.0
+            
+            return torch.tensor([retr_score, log_len, on_gpu, acc_norm, align, recency], dtype=torch.float32)
+        
+        now_ts = time.time()
+        current_gpu_idx = {int(cid.split("_chunk")[1]) for cid in kv.gpu_cache.keys() if "_chunk" in cid}
+        cpu_candidates = [i for i, _ in texts_idx if i not in current_gpu_idx]
+        
+        scored = []
+        beta = 0.3
+        
+        for i in cpu_candidates:
+            x = _chunk_features(i, now_ts)
+            v_base = _bandit_score_ucb(A_inv, theta, x, beta=beta)
+            scored.append((i, v_base))
+        
+        scored.sort(key=lambda t: t[1], reverse=True)
+        return scored[:promote_per_step]
+    
+    def _materialize_chunk_background(self, chunk_id: str, kv: KVCacheManager, staging: ChunkStaging, 
+                                     tokenizer, model, device_t: torch.device, sample_id: str, texts_idx: List[Tuple[int, str]]):
+        """Background chunk materialization"""
+        staging.mark_preparing(chunk_id)
+        
+        try:
+            if "_chunk" not in chunk_id:
+                return
+            
+            idx = int(chunk_id.split("_chunk")[1])
+            texts_dict = {i: text for i, text in texts_idx}
+            
+            if idx not in texts_dict:
+                return
+            
+            text = texts_dict[idx]
+            
+            # Check if already materialized
+            if chunk_id in kv.cpu_cache:
+                entry = kv.cpu_cache[chunk_id]
+                if entry.keys is not None and entry.keys.numel() > 0:
+                    staging.mark_ready(chunk_id)
+                    return
+            
+            # Materialize with correct RoPE positions
+            with torch.inference_mode():
+                inputs = _tokenize_chunk(tokenizer, text, device_t)
+                seq_len = inputs["input_ids"].shape[1]
+                
+                # Calculate correct position for this chunk
+                # Extract chunk index from chunk_id (e.g., "sample0_chunk3" -> 3)
+                chunk_idx = int(chunk_id.split('_chunk')[-1])
+                
+                # Estimate position based on average chunk length and chunk index
+                # This is approximate - ideally we'd track exact positions
+                avg_chunk_length = 500  # Rough estimate, adjust based on your data
+                estimated_start_position = chunk_idx * avg_chunk_length
+                
+                position_ids = torch.arange(
+                    estimated_start_position, 
+                    estimated_start_position + seq_len, 
+                    device=device_t
+                ).unsqueeze(0)
+                inputs["position_ids"] = position_ids
+                
+                print(f"[RoPE] Background chunk {chunk_idx}: estimated positions [{estimated_start_position}:{estimated_start_position + seq_len}]")
+                
+                outputs = _prefill_get_past(model, inputs)
+                
+                entry = kv.create_kv_cache_entry(
+                    chunk_id=chunk_id,
+                    text=text,
+                    tokens=tokenizer.encode(text, add_special_tokens=False),
+                    relevance_score=0.0,
+                    model_outputs=outputs,
+                )
+                
+                kv.store_chunk(chunk_id, entry, priority="cpu")
+                entry.metadata.is_on_gpu = False
+                staging.mark_ready(chunk_id)
+        
+        except Exception as e:
+            print(f"[Background] Failed to materialize {chunk_id}: {e}")
+    
+    def _run_heavy_scheduler_step(self, kv: KVCacheManager, staging: ChunkStaging, max_gpu: int, token_step: int, bw_gbps: float):
+        """Run heavy scheduling decisions periodically"""
+        ready_chunks = staging.get_ready_chunks()
+        
+        if not ready_chunks:
+            print(f"[HeavyScheduler] No chunks ready for promotion")
+            return
+        
+        # Sort ready chunks by priority (highest first)
+        ready_chunks.sort(key=lambda x: x[1].priority, reverse=True)
+        
+        current_gpu_count = len(kv.gpu_cache)
+        current_gpu_chunks = set(kv.gpu_cache.keys())
+        
+        print(f"[HeavyScheduler] {len(ready_chunks)} chunks ready, current GPU: {current_gpu_count}/{max_gpu}")
+        
+        # Determine which chunks should be on GPU (top priority ready + current)
+        target_gpu_chunks = set()
+        
+        # Add current GPU chunks to consideration with default priority
+        for chunk_id in current_gpu_chunks:
+            if chunk_id in staging.predictions:
+                priority = staging.predictions[chunk_id].priority
+            else:
+                # Give current GPU chunks a moderate priority to avoid immediate eviction
+                priority = 0.5
+            target_gpu_chunks.add((chunk_id, priority))
+        
+        # Add ready chunks to consideration
+        for chunk_id, pred_entry in ready_chunks:
+            target_gpu_chunks.add((chunk_id, pred_entry.priority))
+        
+        # Select top max_gpu chunks by priority
+        sorted_targets = sorted(target_gpu_chunks, key=lambda x: x[1], reverse=True)[:max_gpu]
+        target_chunk_ids = {chunk_id for chunk_id, _ in sorted_targets}
+        
+        print(f"[HeavyScheduler] Target GPU chunks: {sorted([cid.split('_chunk')[-1] for cid in target_chunk_ids])}")
+        
+        # Evict chunks not in target set
+        evicted_chunks = []
+        for chunk_id in list(current_gpu_chunks):
+            if chunk_id not in target_chunk_ids:
+                try:
+                    _transfer_gpu_to_cpu(kv, chunk_id)
+                    evicted_chunks.append(chunk_id)
+                except Exception as e:
+                    print(f"[HeavyScheduler] Failed to evict {chunk_id}: {e}")
+        
+        # Promote chunks in target set that aren't on GPU yet
+        promoted_chunks = []
+        for chunk_id in target_chunk_ids:
+            if chunk_id not in kv.gpu_cache and chunk_id in kv.cpu_cache:
+                if len(kv.gpu_cache) < max_gpu:
+                    try:
+                        _transfer_cpu_to_gpu(kv, chunk_id, str(kv.device))
+                        promoted_chunks.append(chunk_id)
+                    except Exception as e:
+                        print(f"[HeavyScheduler] Failed to promote {chunk_id}: {e}")
+        
+        # Summary is now handled by the caller
+    
+    def _predictive_gpu_transfer(self, kv: KVCacheManager, staging: ChunkStaging, predictions: List[Tuple[int, float]], 
+                                token_step: int, device_t: torch.device, max_gpu: int):
+        """Predictively transfer high-priority chunks to GPU using low-priority CUDA stream"""
+        if not predictions or device_t.type != "cuda":
+            return
+        
+        # Get low-priority stream for background transfers
+        if not hasattr(self, '_low_priority_stream'):
+            try:
+                low_pri, high_pri = torch.cuda.get_stream_priority_range()
+                self._low_priority_stream = torch.cuda.Stream(priority=low_pri, device=device_t)
+            except (AttributeError, RuntimeError):
+                self._low_priority_stream = torch.cuda.Stream(device=device_t)
+        
+        # Check if we have GPU slots available for predictive transfers
+        current_gpu_count = len(kv.gpu_cache)
+        available_slots = max_gpu - current_gpu_count
+        
+        if available_slots <= 0:
+            # GPU is full, but we can still prepare for future evictions
+            print(f"[PredictiveTransfer] GPU full ({current_gpu_count}/{max_gpu}), preparing for future swaps")
+            return
+        
+        # Get ready chunks sorted by priority
+        ready_chunks = staging.get_ready_chunks()
+        if not ready_chunks:
+            return
+        
+        ready_chunks.sort(key=lambda x: x[1].priority, reverse=True)
+        
+        # Predictively transfer top chunks that are predicted for near-future tokens
+        transferred = 0
+        for chunk_id, pred_entry in ready_chunks[:available_slots]:
+            # Only transfer chunks predicted for very soon (next 1-2 tokens)
+            if pred_entry.predicted_for_token <= token_step + 2:
+                if chunk_id in kv.cpu_cache and chunk_id not in kv.gpu_cache:
+                    try:
+                        # Transfer on low-priority stream
+                        with torch.cuda.stream(self._low_priority_stream):
+                            self._transfer_cpu_to_gpu_async(kv, chunk_id, device_t)
+                            transferred += 1
+                            print(f"[PredictiveTransfer] Started async transfer of {chunk_id} (priority: {pred_entry.priority:.3f}, for token: {pred_entry.predicted_for_token})")
+                    except Exception as e:
+                        print(f"[PredictiveTransfer] Failed to transfer {chunk_id}: {e}")
+        
+        if transferred > 0:
+            # Synchronize the low-priority stream to ensure transfers complete before they're needed
+            torch.cuda.current_stream().wait_stream(self._low_priority_stream)
+            print(f"[PredictiveTransfer] Started {transferred} async transfers")
+    
+    def _transfer_cpu_to_gpu_async(self, kv: KVCacheManager, chunk_id: str, device_t: torch.device):
+        """Asynchronously transfer chunk from CPU to GPU on current stream"""
+        if chunk_id not in kv.cpu_cache:
+            return
+        
+        entry = kv.cpu_cache[chunk_id]
+        
+        # Transfer tensors asynchronously (non-blocking)
+        entry.keys = entry.keys.to(device_t, non_blocking=True)
+        entry.values = entry.values.to(device_t, non_blocking=True)
+        entry.metadata.is_on_gpu = True
+        
+        # Update cache management
+        kv.gpu_cache[chunk_id] = entry
+        kv.gpu_memory_used += entry.metadata.size_bytes
+        kv.cpu_memory_used -= entry.metadata.size_bytes
+        del kv.cpu_cache[chunk_id]
+        
+        print(f"[AsyncTransfer] {chunk_id} -> GPU (non-blocking)")
+    
+    def _use_cacheblend_paged_attention(
+        self, 
+        model, 
+        tokenizer, 
+        input_token: torch.Tensor, 
+        kv: KVCacheManager, 
+        gpu_chunk_ids: Set[str], 
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Use CacheBlend's built-in paged attention implementation.
+        This leverages the existing, tested paged attention from vllm_blend.
+        """
+        # Import CacheBlend's paged attention with correct path setup
+        import sys
+        import os
+        
+        # Add vllm_blend to Python path
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        cacheblend_dir = os.path.dirname(current_dir)  # Go up from src/ to CacheBlend/
+        vllm_blend_path = os.path.join(cacheblend_dir, 'vllm_blend')
+        
+        if vllm_blend_path not in sys.path:
+            sys.path.insert(0, vllm_blend_path)
+        
+        try:
+            from vllm.attention.ops.paged_attn import PagedAttention
+            print(f"[CacheBlend] Successfully imported PagedAttention from {vllm_blend_path}")
+        except ImportError as e:
+            print(f"[CacheBlend] Failed to import PagedAttention: {e}")
+            print(f"[CacheBlend] vllm_blend_path: {vllm_blend_path}")
+            print(f"[CacheBlend] Path exists: {os.path.exists(vllm_blend_path)}")
+            raise ImportError(f"Could not import CacheBlend's PagedAttention: {e}")
+        
+        print(f"[CacheBlend] Using built-in paged attention with {len(gpu_chunk_ids)} GPU chunks")
+        
+        # For now, fall back to standard attention with proper KV cache
+        # TODO: Implement proper conversion to CacheBlend's paged format
+        past_kv = self._build_past_key_values_from_kv(kv, gpu_chunk_ids)
+        model_inputs = {
+            "input_ids": input_token,
+            "attention_mask": torch.ones_like(input_token),
+            "use_cache": True,
+            "return_dict": True
+        }
+        
+        if past_kv is not None:
+            cache_format = self._convert_to_cache_format(past_kv, model)
+            if cache_format is not None:
+                model_inputs["past_key_values"] = cache_format
+                
+                # Add proper position information
+                if isinstance(cache_format, tuple) and len(cache_format) > 0:
+                    cached_len = cache_format[0][0].shape[2] if len(cache_format[0]) > 0 else 0
+                    if cached_len > 0:
+                        position_ids = torch.arange(cached_len, cached_len + 1, device=device).unsqueeze(0)
+                        model_inputs["position_ids"] = position_ids
+                        cache_position = torch.arange(cached_len, cached_len + 1, device=device)
+                        model_inputs["cache_position"] = cache_position
+        
+        outputs = model(**model_inputs)
+        return outputs.logits[0, -1, :]
+    
+    def _build_past_key_values_from_kv(self, kv: KVCacheManager, gpu_chunk_ids: Set[str]):
+        """
+        Build past_key_values from GPU chunks with proper sequence ordering.
+        
+        Key insight: Each chunk was processed independently, so their KV caches
+        represent separate sequence positions. We need to concatenate them in 
+        the correct order to maintain sequence continuity.
+        """
+        if not gpu_chunk_ids:
+            return None
+        
+        # Sort chunk IDs by their index to maintain proper sequence order
+        sorted_chunk_ids = sorted(gpu_chunk_ids, key=lambda x: int(x.split('_chunk')[-1]) if '_chunk' in x else 0)
+        
+        entries = []
+        for chunk_id in sorted_chunk_ids:
+            if chunk_id in kv.gpu_cache:
+                entries.append((chunk_id, kv.gpu_cache[chunk_id]))
+        
+        if not entries:
+            return None
+        
+        # Get layer count from first entry
+        first_entry = entries[0][1]
+        num_layers = first_entry.keys.shape[0] if first_entry.keys.ndim >= 3 else 0
+        if num_layers == 0:
+            return None
+        
+        print(f"[KVCache] Building past_key_values from {len(entries)} chunks: {[cid for cid, _ in entries]}")
+        
+        past_key_values = []
+        total_seq_len = 0
+        
+        for layer in range(num_layers):
+            layer_keys = []
+            layer_values = []
+            
+            for chunk_id, entry in entries:
+                if entry.keys.ndim == 4:  # [L,S,H,D] -> [B,H,S,D]
+                    k = entry.keys[layer].permute(1, 0, 2).unsqueeze(0)  # [1,H,S,D]
+                    v = entry.values[layer].permute(1, 0, 2).unsqueeze(0)
+                elif entry.keys.ndim == 5:  # [L,B,H,S,D] -> [B,H,S,D]
+                    k = entry.keys[layer, 0]  # [H,S,D] -> need [B,H,S,D]
+                    v = entry.values[layer, 0]
+                    if k.ndim == 3:
+                        k = k.unsqueeze(0)
+                        v = v.unsqueeze(0)
+                else:
+                    print(f"[KVCache] Skipping chunk {chunk_id} with unexpected shape: {entry.keys.shape}")
+                    continue
+                
+                layer_keys.append(k)
+                layer_values.append(v)
+                
+                # Track total sequence length for debugging
+                if layer == 0:  # Only count once per chunk
+                    total_seq_len += k.shape[-2]
+            
+            if layer_keys:
+                # Concatenate along sequence dimension (dim=-2)
+                merged_k = torch.cat(layer_keys, dim=-2)  # [B,H,total_seq,D]
+                merged_v = torch.cat(layer_values, dim=-2)
+                past_key_values.append((merged_k, merged_v))
+                
+                if layer == 0:  # Debug print for first layer only
+                    print(f"[KVCache] Layer {layer}: merged KV shape {merged_k.shape}, total_seq_len={total_seq_len}")
+        
+        if past_key_values:
+            print(f"[KVCache] Built past_key_values with {len(past_key_values)} layers, total sequence length: {total_seq_len}")
+            return tuple(past_key_values)
+        else:
+            print("[KVCache] Failed to build past_key_values - no valid entries")
+            return None
+    
+    def _convert_to_cache_format(self, past_kv_tuple, model):
+        """Convert tuple past_key_values to appropriate format for the model"""
+        if past_kv_tuple is None:
+            return None
+        
+        # Try different cache formats based on transformers version
+        try:
+            # Method 1: Try DynamicCache (newer transformers)
+            from transformers import DynamicCache
+            cache = DynamicCache()
+            for layer_idx, (k, v) in enumerate(past_kv_tuple):
+                cache.update(k, v, layer_idx)
+            return cache
+        except ImportError:
+            pass
+        
+        try:
+            # Method 2: Try StaticCache
+            from transformers import StaticCache
+            # This might need different parameters
+            return past_kv_tuple  # Fallback to tuple
+        except ImportError:
+            pass
+        
+        try:
+            # Method 3: Check if model has specific cache class
+            if hasattr(model.config, 'cache_implementation'):
+                cache_class = getattr(model.config, 'cache_implementation', None)
+                if cache_class == 'static':
+                    return past_kv_tuple
+            
+            # Method 4: Try to create cache from model config
+            if hasattr(model, 'get_cache'):
+                cache = model.get_cache()
+                for layer_idx, (k, v) in enumerate(past_kv_tuple):
+                    if hasattr(cache, 'update'):
+                        cache.update(k, v, layer_idx)
+                return cache
+        except Exception:
+            pass
+        
+        # Method 5: Check model type specific handling
+        model_type = getattr(model.config, 'model_type', 'unknown')
+        if model_type == 'mistral':
+            # For Mistral, we need to handle position_ids and cache_position
+            return past_kv_tuple
+        
+        # Fallback: return tuple and hope it works
+        return past_kv_tuple

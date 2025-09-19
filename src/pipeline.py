@@ -346,7 +346,7 @@ class FinalDecoder:
         self,
         question_text: str,
         past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
-        max_new_tokens: int = 128,
+        max_new_tokens: int = 10,
     ) -> Dict[str, Any]:
         """Decode `Answer:` given a question suffix, optionally with past KV."""
         suffix = f"Question: {question_text}\nAnswer:"
@@ -417,8 +417,8 @@ def main():
     # Output paths
     retrieval_json_path = _abs_path(args.output, cfg["paths"]["retrieval_json"])
     kv_summary_path = _abs_path(args.output, cfg["paths"]["kv_summary_json"])
-    pred_out_path = _abs_path(args.output, cfg["speculative"].get("out_path", "speculative_next.json"))
     sched_out_path = _abs_path(args.output, cfg["scheduler"].get("out_path", "scheduler/decoder_trace.json"))
+    per_step_debug_path = os.path.join(args.output, "per_step_debug.json")  # New debug output
     final_results_path = os.path.join(args.output, "final_results.json")
     summary_path = os.path.join(args.output, "summary.json")
 
@@ -454,9 +454,8 @@ def main():
     decoder = FinalDecoder(model_id=model_id, device=device, provided_tokenizer=shared_tokenizer, provided_model=shared_model)
 
     aggregated_kv: List[Dict[str, Any]] = []
-    pred_trace_all: List[Dict[str, Any]] = []
-    pred_results_all: List[Dict[str, Any]] = []
     sched_trace_all: List[Dict[str, Any]] = []
+    per_step_debug_all: List[Dict[str, Any]] = []  # New debug collection
     final_answers: List[Dict[str, Any]] = []
 
     kv_root = _abs_path(args.output, cfg["kv_builder"].get("save_cache_dir", "kv_caches"))
@@ -474,96 +473,99 @@ def main():
             samples[si] = sample
             _write_json(retrieval_json_path, samples)
 
-        # 2) KV Cache Build: only top‑k keep real K/V; others placeholders (no disk save)
-        sample_dir = os.path.join(kv_root, f"sample{si+1}")
-        os.makedirs(sample_dir, exist_ok=True)
-
-        kv_payload = kv_builder.build(
-            samples=[sample],
-            model_id=model_id,
-            device=device,
-            top_k=int(cfg["cache"]["max_gpu_chunks"]),
-            max_samples=1,
-            max_gpu_chunks=int(cfg["cache"]["max_gpu_chunks"]),
-            max_cpu_chunks=int(cfg["cache"]["max_cpu_chunks"]),
-            gpu_mem_gb=float(cfg["cache"]["gpu_memory_limit_gb"]),
-            cpu_mem_gb=float(cfg["cache"]["cpu_memory_limit_gb"]),
-            dump_placements=False,
-            save_cache_dir="",
-            save_placeholders=False,
-            retrieval_json_path=retrieval_json_path if os.path.exists(retrieval_json_path) else "",
-            provided_tokenizer=shared_tokenizer,
-            provided_model=shared_model,
-            defer_save=True,
-        )
-
-        # Build top‑k index list
+        # 2) Skip separate KV build - let the per-step scheduler handle it
+        # Build top‑k index list for initial GPU placement
         topk_indices = _topk_indices_from_sample(sample, cfg)
-
-        aggregated_kv.append({"sample_index": si, **{k: v for k, v in kv_payload.items() if k != "_manager"}})
-        _write_json(kv_summary_path, {"per_sample": aggregated_kv})
-
-        # Start set on GPU = **top‑k only**
         gpu_indices_initial = sorted(set(int(i) for i in topk_indices))
+        
+        # Log what we're doing
+        logger.info(f"[Sample {si}] Initial GPU chunks: {gpu_indices_initial}")
 
-        # 3) Initial decoding (with current GPU set)
-        # Prefer in-memory KV from manager to avoid any disk I/O
-        manager = kv_payload.get("_manager")
-        if manager is not None:
-            past_init = _merge_kvs_from_manager(manager, gpu_indices_initial, decoder.device, next(decoder.mdl.parameters()).dtype)
-        else:
-            past_init = _load_and_merge_kvs(sample_dir, gpu_indices_initial, decoder.device, next(decoder.mdl.parameters()).dtype)
-        decode_metrics_initial = decoder.decode_with_saved_kvs(
-            question_text=sample.get("question", ""),
-            past=past_init,
-            max_new_tokens=cfg.get("generation", {}).get("max_new_tokens", 128),
-        )
+        # 3) Skip initial decoding - go directly to per-step
 
-        # 4) Speculative prediction is now integrated into the scheduler
-
-        # 5) Scheduler (promote/evict across CPU/GPU)
-        sched_payload = scheduler.run(
-            pred_payload={},
+        # 5) NEW: Per-step decoding with lightweight prediction + periodic scheduling
+        per_step_result = scheduler.run_per_step_decode(
             retr_samples=[sample],
             model_id=model_id,
             device=device,
             dtype=str(cfg["model"].get("dtype", "auto")),
             max_gpu=int(cfg["scheduler"]["max_gpu"]),
-            step_duration_ms=int(cfg["scheduler"]["step_duration_ms"]),
-            safety_margin_ms=int(cfg["scheduler"]["safety_margin_ms"]),
             max_samples=1,
-            load_cache_dir="",                  # no disk I/O
-            cache_filter_prefix="auto",
-            load_initial_to_gpu=True,
-            out_path=None,
-            enable_progress=bool(cfg["scheduler"].get("enable_progress", False)),
+            max_new_tokens=cfg.get("generation", {}).get("max_new_tokens", 10),
+            scheduler_interval=int(cfg["scheduler"].get("scheduler_interval", 5)),  # Heavy scheduler every N tokens
             provided_tokenizer=shared_tokenizer,
             provided_model=shared_model,
-            steps=int(cfg["scheduler"].get("steps", cfg["speculative"].get("steps", 16))),
-            promote_per_step=int(cfg["scheduler"].get("promote_per_step", cfg["speculative"].get("promote_per_step", 2))),
+            promote_per_step=int(cfg["scheduler"].get("promote_per_step", 2)),
+            initial_gpu_indices=gpu_indices_initial,  # Pass initial GPU chunk selection
         )
-        for row in sched_payload.get("trace", []):
-            row["sample_index"] = si
-        sched_trace_all.extend(sched_payload.get("trace", []))
-        _write_json(sched_out_path, {"trace": sched_trace_all})
-
-        # 6) Final decoding with scheduled GPU set (seeded by our initial top‑k)
-        final_gpu_indices = _compute_final_gpu_indices(gpu_indices_initial, sched_payload)
-        if manager is not None:
-            past_final = _merge_kvs_from_manager(manager, final_gpu_indices, decoder.device, next(decoder.mdl.parameters()).dtype)
+        
+        # Extract result for this sample
+        if per_step_result.get("results") and len(per_step_result["results"]) > 0:
+            decode_metrics_final = per_step_result["results"][0]
+            
+            # Print per-step debug info to terminal
+            logger.info(f"[Sample {si}] Per-step decoding completed:")
+            logger.info(f"  - Question: {sample.get('question', '')}")
+            logger.info(f"  - Answer: {decode_metrics_final.get('answer', '')}")
+            logger.info(f"  - Generated tokens: {decode_metrics_final.get('decoded_tokens', 0)}")
+            logger.info(f"  - TTFT: {decode_metrics_final.get('ttft', 0):.3f}s")
+            logger.info(f"  - E2E latency: {decode_metrics_final.get('e2e_latency', 0):.3f}s")
+            logger.info(f"  - TPOT: {decode_metrics_final.get('tpot', 0):.3f}s")
+            logger.info(f"  - Throughput: {decode_metrics_final.get('throughput', 0):.2f} tokens/s")
+            
+            # Update trace with sample index and collect debug info
+            if "trace" in decode_metrics_final:
+                sample_debug = {
+                    "sample_index": si,
+                    "sample_id": sample_id,
+                    "question": sample.get("question", ""),
+                    "answer": decode_metrics_final.get("answer", ""),
+                    "metrics": {
+                        "ttft": decode_metrics_final.get("ttft", 0),
+                        "e2e_latency": decode_metrics_final.get("e2e_latency", 0),
+                        "throughput": decode_metrics_final.get("throughput", 0),
+                        "decoded_tokens": decode_metrics_final.get("decoded_tokens", 0)
+                    },
+                    "per_token_trace": decode_metrics_final["trace"]
+                }
+                per_step_debug_all.append(sample_debug)
+                
+                # Print token-by-token info
+                for i, token_info in enumerate(decode_metrics_final["trace"][:5]):  # Show first 5 tokens
+                    predictions = token_info.get("predictions", [])
+                    staging = token_info.get("staging_stats", {})
+                    # logger.info(f"    Token {i}: predicted chunks {[p[0] if isinstance(p, tuple) else p for p in predictions]}, "
+                    #           f"staging: {staging.get('predictions', 0)} pred, {staging.get('preparing', 0)} prep, {staging.get('ready', 0)} ready")
+                
+                # if len(decode_metrics_final["trace"]) > 5:
+                #     logger.info(f"    ... and {len(decode_metrics_final['trace']) - 5} more tokens")
+                
+                for row in decode_metrics_final["trace"]:
+                    row["sample_index"] = si
+                sched_trace_all.extend(decode_metrics_final["trace"])
+                _write_json(sched_out_path, {"trace": sched_trace_all})
+                _write_json(per_step_debug_path, {"per_step_debug": per_step_debug_all})
         else:
-            past_final = _load_and_merge_kvs(sample_dir, final_gpu_indices, decoder.device, next(decoder.mdl.parameters()).dtype)
-        decode_metrics_final = decoder.decode_with_saved_kvs(
-            question_text=sample.get("question", ""),
-            past=past_final,
-            max_new_tokens=cfg.get("generation", {}).get("max_new_tokens", 128),
-        )
+            # Fallback to old method if per-step fails
+            logger.warning(f"[Sample {si}] Per-step decoding failed, falling back to standard decoding")
+            decode_metrics_final = decoder.decode_with_saved_kvs(
+                question_text=sample.get("question", ""),
+                past=past_init,
+                max_new_tokens=cfg.get("generation", {}).get("max_new_tokens", 10),
+            )
 
+        # Extract final GPU indices from the per-step result
+        final_gpu_indices = gpu_indices_initial  # Default fallback
+        if "trace" in decode_metrics_final and decode_metrics_final["trace"]:
+            # Get GPU chunks from last step
+            last_step = decode_metrics_final["trace"][-1]
+            final_gpu_indices = list(range(last_step.get("gpu_chunks", len(gpu_indices_initial))))
+        
         # Record final row (initial metrics kept in case you wish to log separately)
         final_answers.append({
             "sample_index": si,
             "question": sample.get("question", ""),
-            "mode": "full_kv_reuse",
+            "mode": "full_kv_reuse_per_step",
             "gpu_indices_initial": gpu_indices_initial,
             "gpu_indices_final": final_gpu_indices,
             **decode_metrics_final,
@@ -595,8 +597,8 @@ def main():
             "outputs": {
                 "retrieval_json": retrieval_json_path,
                 "kv_summary_json": kv_summary_path,
-                "speculative_json": pred_out_path,
                 "scheduler_json": sched_out_path,
+                "per_step_debug_json": per_step_debug_path,
                 "final_results_json": final_results_path,
                 "kv_root": kv_root,
             },
@@ -621,8 +623,8 @@ def main():
         "outputs": {
             "retrieval_json": retrieval_json_path,
             "kv_summary_json": kv_summary_path,
-            "speculative_json": pred_out_path,
             "scheduler_json": sched_out_path,
+            "per_step_debug_json": per_step_debug_path,
             "final_results_json": final_results_path,
             "kv_root": kv_root,
         },
@@ -635,6 +637,8 @@ def main():
         "timestamps": {"finished_at": time.strftime("%Y-%m-%d %H:%M:%S")},
     })
     logger.info(f"[pipeline] Done. Summary: {summary_path}")
+    logger.info(f"[pipeline] Per-step debug info saved to: {per_step_debug_path}")
+    logger.info(f"[pipeline] Scheduler trace saved to: {sched_out_path}")
 
 
 if __name__ == "__main__":
