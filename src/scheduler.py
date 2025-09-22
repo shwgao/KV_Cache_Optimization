@@ -455,7 +455,7 @@ class TangoScheduler:
 
         for si, ps in samp_iter:
             sample = retr_samples[si]
-            sample_id = str(sample.get("id", f"sample{si}"))
+            sample_id = str(sample.get("id", f"{si}"))
             texts_idx: List[Tuple[int, str]] = extract_texts(sample)
 
             kv = KVCacheManager(
@@ -817,20 +817,19 @@ class TangoScheduler:
         else:
             torch_dtype = torch.bfloat16 if (device_t.type == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability(device_t)[0] >= 8) else None
 
-        tokenizer = provided_tokenizer if provided_tokenizer is not None else AutoTokenizer.from_pretrained(model_id)
-        model = provided_model if provided_model is not None else AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
+        tokenizer = provided_tokenizer
+        model = provided_model
         model = model.to(device_t)
         model.eval()
 
-        if not isinstance(retr_samples, list) or not retr_samples:
-            raise RuntimeError("Retrieval samples are empty or invalid")
         if max_samples > 0:
             retr_samples = retr_samples[:max_samples]
+
 
         results = []
         
         for si, sample in enumerate(retr_samples):
-            sample_id = str(sample.get("id", f"sample{si}"))
+            sample_id = f"{si}"
             texts_idx: List[Tuple[int, str]] = extract_texts(sample)
             
             # Initialize KV cache manager
@@ -856,13 +855,6 @@ class TangoScheduler:
             # Background materialization queue
             materialization_queue = Queue()
             
-            # Use provided initial GPU indices or fall back to retrieved indices
-            if initial_gpu_indices is None:
-                retrieved = sample.get("retrieved_indices", [])
-                if isinstance(retrieved, list):
-                    initial_gpu_indices = [int(i) for i in retrieved[:max_gpu]]
-                else:
-                    initial_gpu_indices = []
             
             print(f"[PerStepDecode] Sample {si}: Using initial GPU chunks {initial_gpu_indices}")
             
@@ -876,7 +868,7 @@ class TangoScheduler:
                     # Apply correct RoPE positions
                     inputs = _tokenize_chunk(tokenizer, text, device_t)
                     seq_len = inputs["input_ids"].shape[1]
-                    
+
                     # Create position_ids starting from cumulative position
                     position_ids = torch.arange(
                         cumulative_position, 
@@ -895,9 +887,8 @@ class TangoScheduler:
                         relevance_score=1.0,
                         model_outputs=outputs,
                     )
+
                     kv.store_chunk(cid, entry, priority="gpu")
-                    print(f"[PerStepDecode] Created initial GPU chunk: {cid} with correct RoPE")
-                    
                     cumulative_position += seq_len
             
             # Create placeholders for remaining chunks
@@ -980,14 +971,34 @@ class TangoScheduler:
     ) -> Dict[str, Any]:
         """Core per-step decoding logic"""
         
-        # Prepare input - use simple format without cached chunks for first token
+        # Prepare input: include context via stored KV if available; otherwise prepend text context
         question_text = sample.get("question", "")
-        suffix = f"Question: {question_text}\nAnswer:"
+        # Use only the question (no "Answer:" prefix) to avoid injecting stylistic tokens
+        suffix = f"Question: {question_text}"
         
         # Extract and display the question
-        question = suffix.split('Question: ')[1].split('\nAnswer:')[0].strip() if 'Question: ' in suffix else suffix
+        question = suffix.split('Question: ')[1].strip() if 'Question: ' in suffix else suffix
         print(f"[Question] {question}")
         
+        # Attempt to build past_key_values from currently available GPU chunks for first token
+        current_gpu_chunks = set(kv.gpu_cache.keys())
+        built_past = self._build_past_key_values_from_kv(kv, current_gpu_chunks)
+        cache_for_model = None
+        cached_len_for_pos = 0
+        if built_past is not None:
+            try:
+                cache_for_model = self._convert_to_cache_format(built_past, model)
+                if isinstance(cache_for_model, tuple) and len(cache_for_model) > 0:
+                    # Infer cached length from first layer's K: shape [B, H, S, D]
+                    cached_len_for_pos = cache_for_model[0][0].shape[2]
+            except Exception as e:
+                print(f"[FirstToken] Failed to convert built KV to model cache: {e}")
+                cache_for_model = None
+                cached_len_for_pos = 0
+        else:
+            print("No cache for model")
+        
+        # Always include the question tokens as input_ids for the first token decoding
         enc = tokenizer([suffix], return_tensors="pt", padding=True, truncation=False)
         input_ids = enc["input_ids"].to(device_t)
         
@@ -1017,20 +1028,26 @@ class TangoScheduler:
         
         try:
             for token_step in range(max_new_tokens):
-                token_start_time = time.time()
                 
                 # 1. Generate one token using CacheBlend's paged attention
                 current_gpu_chunks = set(kv.gpu_cache.keys())
                 
                 with torch.no_grad():
                     if token_step == 0:
-                        # For first token, use standard model forward (no cache yet)
+                        # For first token, use model forward with stored KV if available
                         model_inputs = {
                             "input_ids": input_ids,
                             "attention_mask": torch.ones_like(input_ids),
                             "use_cache": True,
                             "return_dict": True
                         }
+                        if cache_for_model is not None:
+                            model_inputs["past_key_values"] = cache_for_model
+                            # Ensure correct positions after cached context
+                            if cached_len_for_pos > 0:
+                                position_ids = torch.arange(cached_len_for_pos, cached_len_for_pos + input_ids.shape[1], device=device_t).unsqueeze(0)
+                                model_inputs["position_ids"] = position_ids
+                                model_inputs["cache_position"] = torch.arange(cached_len_for_pos, cached_len_for_pos + input_ids.shape[1], device=device_t)
                         outputs = model(**model_inputs)
                         next_token_logits = outputs.logits[0, -1, :]
                     else:
@@ -1038,75 +1055,25 @@ class TangoScheduler:
                         last_token = torch.tensor([[generated_tokens[-1]]], device=device_t)
                         
                         # Use CacheBlend's built-in paged attention with proper KV cache format
-                        try:
-                            next_token_logits = self._use_cacheblend_paged_attention(
-                                model, tokenizer, last_token, kv, current_gpu_chunks, device_t
-                            )
-                            print(f"[CacheBlend] Successfully used paged attention with {len(current_gpu_chunks)} GPU chunks")
-                        except Exception as e:
-                            print(f"[CacheBlend] Paged attention failed: {e}, falling back to standard")
-                            # Fallback to standard model inference
-                            past_kv = self._build_past_key_values_from_kv(kv, current_gpu_chunks)
-                            model_inputs = {
-                                "input_ids": last_token,
-                                "attention_mask": torch.ones_like(last_token),
-                                "use_cache": True,
-                                "return_dict": True
-                            }
-                            if past_kv is not None:
-                                try:
-                                    cache_format = self._convert_to_cache_format(past_kv, model)
-                                    if cache_format is not None:
-                                        model_inputs["past_key_values"] = cache_format
-                                        # Add position info
-                                        if isinstance(cache_format, tuple) and len(cache_format) > 0:
-                                            cached_len = cache_format[0][0].shape[2] if len(cache_format[0]) > 0 else 0
-                                            if cached_len > 0:
-                                                position_ids = torch.arange(cached_len, cached_len + 1, device=device_t).unsqueeze(0)
-                                                model_inputs["position_ids"] = position_ids
-                                except Exception as cache_e:
-                                    print(f"[CacheBlend] Standard cache conversion also failed: {cache_e}")
-                            outputs = model(**model_inputs)
-                            next_token_logits = outputs.logits[0, -1, :]
+                        next_token_logits = self._use_cacheblend_paged_attention(
+                            model, tokenizer, last_token, kv, current_gpu_chunks, device_t
+                        )
+                        print(f"[CacheBlend] Successfully used paged attention with {len(current_gpu_chunks)} GPU chunks")
                     
-                    # Apply better token filtering
-                    # Avoid problematic tokens
-                    problematic_tokens = [tokenizer.pad_token_id, tokenizer.unk_token_id]
-                    if hasattr(tokenizer, 'mask_token_id') and tokenizer.mask_token_id is not None:
-                        problematic_tokens.append(tokenizer.mask_token_id)
-                    
-                    # Set problematic tokens to very low probability
-                    for bad_token in problematic_tokens:
-                        if bad_token is not None:
-                            next_token_logits[bad_token] = float('-inf')
-                    
-                    # Also avoid the specific problematic tokens we saw
-                    next_token_logits[28705] = float('-inf')  # Empty string token
-                    next_token_logits[398] = float('-inf')    # Asterisk token
-                    
-                    # Use sampling instead of greedy for better variety
-                    if token_step == 0:
-                        # For first token, use greedy
-                        next_token = torch.argmax(next_token_logits).item()
-                    else:
-                        # For subsequent tokens, use top-k sampling
-                        top_k = 10
-                        top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
-                        probs = torch.softmax(top_k_logits, dim=-1)
-                        next_token_idx = torch.multinomial(probs, 1).item()
-                        next_token = top_k_indices[next_token_idx].item()
+                    # Greedy decoding for all steps (deterministic)
+                    next_token = torch.argmax(next_token_logits).item()
                     
                     generated_tokens.append(next_token)
                     
                     # Show progress every few tokens
-                    if token_step == 0 or token_step % 3 == 0:
-                        decoded_token = tokenizer.decode([next_token], skip_special_tokens=True)
-                        print(f"[Token {token_step}] '{decoded_token}'", end=" " if token_step % 9 != 0 else "\n")
-                
+                    decoded_token = tokenizer.decode([next_token], skip_special_tokens=True)
+                    print(f"[Token {token_step}] '{decoded_token}'", end=" " if token_step % 9 != 0 else "\n")
+
+
                 token_end_time = time.time()
                 if first_token_time is None:
                     first_token_time = token_end_time
-                
+                    
                 # 2. Lightweight prediction using bandit (existing method)
                 predictions = self._predict_chunks_bandit(
                     sample_id=sample_id,

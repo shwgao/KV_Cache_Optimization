@@ -391,9 +391,9 @@ class FinalDecoder:
 def main():
     """Entry point: runs retrieval → KV build (top‑k only) → decode → schedule → decode."""
     ap = argparse.ArgumentParser("Full KV Reuse Pipeline WITH speculative + scheduler (fixed)")
-    ap.add_argument("--config", required=True, help="Path to config.yaml")
-    ap.add_argument("--input", required=True, help="Path to input dataset JSON")
-    ap.add_argument("--output", default="pipeline_results", help="Output directory")
+    ap.add_argument("--config", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/configs/config.yaml", help="Path to config.yaml")
+    ap.add_argument("--input", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/inputs/musique_s.json", help="Path to input dataset JSON")
+    ap.add_argument("--output", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/results/pipeline_results", help="Output directory")
     ap.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
     args = ap.parse_args()
 
@@ -461,7 +461,7 @@ def main():
     kv_root = _abs_path(args.output, cfg["kv_builder"].get("save_cache_dir", "kv_caches"))
 
     logger.info("[Pipeline] Running full_kv_reuse + speculative + scheduler (fixed)")
-    for si in tqdm(range(len(samples)), desc="Samples", unit="sample"):
+    for si in tqdm(range(1), desc="Samples", unit="sample"):
         sample = samples[si]
         sample_id = str(sample.get("id", f"sample{si}"))
 
@@ -477,9 +477,6 @@ def main():
         # Build top‑k index list for initial GPU placement
         topk_indices = _topk_indices_from_sample(sample, cfg)
         gpu_indices_initial = sorted(set(int(i) for i in topk_indices))
-        
-        # Log what we're doing
-        logger.info(f"[Sample {si}] Initial GPU chunks: {gpu_indices_initial}")
 
         # 3) Skip initial decoding - go directly to per-step
 

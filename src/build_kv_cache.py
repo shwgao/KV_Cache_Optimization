@@ -49,6 +49,7 @@ def extract_texts(sample: Dict[str, Any]) -> List[Tuple[int, str]]:
                 s = (it.get("text") or it.get("content") or "").strip()
                 if s:
                     pairs.append((i, s))
+
     return pairs
 
 def _save_chunk(cache_dir: str, entry: KVCacheEntry) -> None:
