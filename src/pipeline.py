@@ -95,9 +95,9 @@ def topk_indices_from_sample(sample: Dict[str, Any], cfg: Dict[str, Any]) -> Lis
 def main():
     """CORRECTED: Main pipeline with proper retrieval integration"""
     ap = argparse.ArgumentParser("Full KV Reuse Pipeline WITH speculative scheduler (fixed)")
-    ap.add_argument("--config", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/configs/config.yaml", help="Path to config.yaml")
-    ap.add_argument("--input", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/inputs/musique_s.json", help="Path to input dataset JSON")
-    ap.add_argument("--output", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/results/pipeline_results", help="Output directory")
+    ap.add_argument("--config", default="configs/config.yaml", help="Path to config.yaml")
+    ap.add_argument("--input", default="inputs/musique_s.json", help="Path to input dataset JSON")
+    ap.add_argument("--output", default="results/pipeline_results", help="Output directory")
     ap.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
     args = ap.parse_args()
     

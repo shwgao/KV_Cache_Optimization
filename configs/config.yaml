@@ -54,7 +54,7 @@ scheduler:
   max_gpu: 10
   max_samples: 0           # 0 = all
   scheduler_interval: 5    # Run heavy scheduler every N tokens
-  promote_per_step: 2      # Number of chunks to predict/promote per token
+  promote_per_step: 10      # Number of chunks to predict/promote per token
   enable_progress: false
   out_path: scheduler/decoder_trace.json
 
