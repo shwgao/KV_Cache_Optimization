@@ -20,22 +20,22 @@ from scheduler import TangoScheduler
 
 # ---------------- utilities ----------------
 
-def _read_json(path: str) -> Any:
+def read_json(path: str) -> Any:
     """Read a JSON file and return the parsed object."""
     with open(path, "r") as f:
         return json.load(f)
 
 
-def _write_json(path: str, obj: Any):
+def write_json(path: str, obj: Any):
     """Write an object to JSON, creating parent dirs as needed."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(obj, f, indent=2, default=str)
 
 
-def _load_samples(path: str) -> List[Dict[str, Any]]:
+def load_samples(path: str) -> List[Dict[str, Any]]:
     """Load dataset samples from JSON supporting several common shapes."""
-    data = _read_json(path)
+    data = read_json(path)
     if isinstance(data, list):
         return data
     if isinstance(data, dict) and "samples" in data:
@@ -45,14 +45,14 @@ def _load_samples(path: str) -> List[Dict[str, Any]]:
     return [data]
 
 
-def _abs_path(base_dir: str, maybe_path: str) -> str:
+def abs_path(base_dir: str, maybe_path: str) -> str:
     """Resolve a possibly relative path against a base directory."""
     if not maybe_path:
         return ""
     return maybe_path if os.path.isabs(maybe_path) else os.path.join(base_dir, maybe_path)
 
 
-def _setup_logging(level: str = "INFO") -> logging.Logger:
+def setup_logging(level: str = "INFO") -> logging.Logger:
     """Configure module logging and return the pipeline logger."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -62,12 +62,12 @@ def _setup_logging(level: str = "INFO") -> logging.Logger:
     return logging.getLogger("pipeline_full_kv_reuse_fixed")
 
 
-def _load_existing_retrieval(retrieval_json_path: str, logger: logging.Logger) -> Optional[List[Dict[str, Any]]]:
+def load_existing_retrieval(retrieval_json_path: str, logger: logging.Logger) -> Optional[List[Dict[str, Any]]]:
     """If an existing retrieval JSON exists, load and return its samples."""
     if not retrieval_json_path or not os.path.exists(retrieval_json_path):
         return None
     try:
-        data = _read_json(retrieval_json_path)
+        data = read_json(retrieval_json_path)
         if isinstance(data, list):
             samples = data
         elif isinstance(data, dict) and "results" in data:
@@ -83,354 +83,56 @@ def _load_existing_retrieval(retrieval_json_path: str, logger: logging.Logger) -
         logger.warning(f"[Retrieval] Failed to read existing retrieval JSON ({retrieval_json_path}): {e}")
         return None
 
-
-def _restructure_kv_cache_dir_to_numeric(sample_cache_dir: str, expected_sample_id: str, logger: logging.Logger):
-    """Normalize chunk subfolders to numeric names (0,1,2,...) to simplify later joins."""
-    if not sample_cache_dir or not os.path.isdir(sample_cache_dir):
-        return
-    for name in os.listdir(sample_cache_dir):
-        src = os.path.join(sample_cache_dir, name)
-        if not os.path.isdir(src):
-            continue
-        meta_path = os.path.join(src, "metadata.json")
-        if not os.path.isfile(meta_path):
-            # try parse from folder name
-            if name.isdigit():
-                continue
-            if "_chunk" in name:
-                try:
-                    idx = int(name.split("_chunk")[-1])
-                    dst = os.path.join(sample_cache_dir, str(idx))
-                    if src != dst and not os.path.exists(dst):
-                        os.rename(src, dst)
-                except Exception:
-                    pass
-            continue
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            chunk_id = str(meta.get("chunk_id", ""))
-            if "_chunk" not in chunk_id:
-                continue
-            sample_id_part, idx_part = chunk_id.rsplit("_chunk", 1)
-            if expected_sample_id and sample_id_part != expected_sample_id:
-                continue
-            idx = int(idx_part)
-            dst = os.path.join(sample_cache_dir, str(idx))
-            if src != dst and not os.path.exists(dst):
-                os.rename(src, dst)
-        except Exception as e:
-            logger.warning(f"[KV] Could not restructure '{src}' -> numeric: {e}")
-
-
-def _topk_indices_from_sample(sample: Dict[str, Any], cfg: Dict[str, Any]) -> List[int]:
+def topk_indices_from_sample(sample: Dict[str, Any], cfg: Dict[str, Any]) -> List[int]:
     """Return the numeric indices for the top‑k passages we want on GPU initially."""
     rkey = cfg["retrieval"]["retrieved_key"]
     retrieved = sample.get(rkey, []) or []
     max_gpu = int(cfg["cache"]["max_gpu_chunks"])
     return [int(i) for i in (retrieved[:max_gpu] if isinstance(retrieved, list) else [])]
 
-
-def _prune_non_topk_kv_files(sample_dir: str, keep_indices: List[int], logger: logging.Logger):
-    """Delete K/V tensor files for non‑top‑k chunks, keeping only metadata/placeholders."""
-    keep_set = set(keep_indices)
-    for name in os.listdir(sample_dir):
-        if not name.isdigit():
-            continue
-        idx = int(name)
-        if idx in keep_set:
-            continue
-        cdir = os.path.join(sample_dir, name)
-        for fname in ("keys.pt", "values.pt", "valid_mask.pt"):
-            fpath = os.path.join(cdir, fname)
-            if os.path.isfile(fpath):
-                try:
-                    os.remove(fpath)
-                except Exception as e:
-                    logger.warning(f"[KV] Could not remove {fpath}: {e}")
-
-
-def _compute_final_gpu_indices(initial_gpu_indices: List[int], sched_payload: Dict[str, Any]) -> List[int]:
-    """Apply scheduler promotions/evictions on top of our initial top‑k GPU set."""
-    gpu_set = set(int(i) for i in initial_gpu_indices)
-    for row in sched_payload.get("trace", []):
-        for cid in row.get("promoted", []):
-            if isinstance(cid, str) and "_chunk" in cid:
-                try:
-                    gpu_set.add(int(cid.split("_chunk")[1]))
-                except Exception:
-                    pass
-            elif isinstance(cid, int):
-                gpu_set.add(cid)
-        for cid in row.get("evicted", []):
-            if isinstance(cid, str) and "_chunk" in cid:
-                try:
-                    gpu_set.discard(int(cid.split("_chunk")[1]))
-                except Exception:
-                    pass
-            elif isinstance(cid, int):
-                gpu_set.discard(cid)
-    return sorted(gpu_set)
-
-
-# ---------------- KV load/merge + decoding ----------------
-
-def _load_and_merge_kvs(
-    sample_dir: str,
-    indices: List[int],
-    device: torch.device,
-    model_dtype: torch.dtype,
-) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
-    """
-    Load K/V tensors for the requested chunk indices and concatenate along the
-    sequence dimension: returns a past_key_values structure compatible with HF.
-    Skips indices without real K/V files (e.g., placeholders).
-    """
-    if not indices:
-        return None
-
-    merged_k: List[List[torch.Tensor]] = []
-    merged_v: List[List[torch.Tensor]] = []
-    num_layers = None
-
-    def _normalize_kv(k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Accept [L,H,S,D] or [L,B,H,S,D] -> return [L,1,H,S,D]
-        if k.ndim == 4:
-            k = k.unsqueeze(1)
-        if v.ndim == 4:
-            v = v.unsqueeze(1)
-        return k, v
-
-    for idx in indices:
-        cdir = os.path.join(sample_dir, str(idx))
-        k_path = os.path.join(cdir, "keys.pt")
-        v_path = os.path.join(cdir, "values.pt")
-        if not (os.path.isfile(k_path) and os.path.isfile(v_path)):
-            continue  # placeholder; background worker should materialize it
-        k = torch.load(k_path, map_location="cpu")
-        v = torch.load(v_path, map_location="cpu")
-        k, v = _normalize_kv(k, v)  # [L,1,H,S,D]
-        if num_layers is None:
-            num_layers = k.shape[0]
-            merged_k = [[] for _ in range(num_layers)]
-            merged_v = [[] for _ in range(num_layers)]
-        assert k.shape[0] == num_layers and v.shape[0] == num_layers
-        for L in range(num_layers):
-            merged_k[L].append(k[L, 0])  # [H,S,D]
-            merged_v[L].append(v[L, 0])
-
-    if num_layers is None:
-        return None
-
-    past: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    for L in range(num_layers):
-        if not merged_k[L]:
-            return None
-        k_cat = torch.cat(merged_k[L], dim=1).unsqueeze(0).to(device=device, dtype=model_dtype)  # [1,H,S,D]
-        v_cat = torch.cat(merged_v[L], dim=1).unsqueeze(0).to(device=device, dtype=model_dtype)
-        past.append((k_cat, v_cat))
-    return past
-
-
-def _merge_kvs_from_manager(
-    manager,
-    indices: List[int],
-    device: torch.device,
-    model_dtype: torch.dtype,
-) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
-    """Merge in-memory K/V tensors for selected indices from a KVCacheManager.
-    Returns HF-compatible past_key_values or None if missing.
-    """
-    if not indices:
-        return None
-    merged_k: List[List[torch.Tensor]] = []
-    merged_v: List[List[torch.Tensor]] = []
-    num_layers = None
-
-    for idx in indices:
-        cid = None
-        # infer sample id from any one entry in cache
-        # here we scan both caches
-        # expected chunk id pattern: "{sample_id}_chunk{idx}"
-        for pool in (manager.gpu_cache, manager.cpu_cache):
-            for key in pool.keys():
-                if key.endswith(f"_chunk{idx}"):
-                    cid = key
-                    break
-            if cid:
-                break
-        if cid is None:
-            continue
-        entry = manager.gpu_cache.get(cid) or manager.cpu_cache.get(cid)
-        if entry is None:
-            continue
-        k = entry.keys
-        v = entry.values
-        # Normalize to [L,1,H,S,D] like the disk path
-        if k.ndim == 4 and v.ndim == 4:
-            # entry layout is [L,S,H,D] per KVCacheManager -> permute to [L,H,S,D] and add batch
-            k = k.permute(0, 2, 1, 3).unsqueeze(1)
-            v = v.permute(0, 2, 1, 3).unsqueeze(1)
-        elif k.ndim == 5 and v.ndim == 5:
-            # already [L,B,H,S,D]
-            pass
-        if num_layers is None:
-            num_layers = k.shape[0]
-            merged_k = [[] for _ in range(num_layers)]
-            merged_v = [[] for _ in range(num_layers)]
-        for L in range(num_layers):
-            merged_k[L].append(k[L, 0])  # [H,S,D]
-            merged_v[L].append(v[L, 0])
-
-    if num_layers is None:
-        return None
-
-    past: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    for L in range(num_layers):
-        if not merged_k[L]:
-            return None
-        k_cat = torch.cat(merged_k[L], dim=1).unsqueeze(0).to(device=device, dtype=model_dtype)
-        v_cat = torch.cat(merged_v[L], dim=1).unsqueeze(0).to(device=device, dtype=model_dtype)
-        past.append((k_cat, v_cat))
-    return past
-
-
-class FinalDecoder:
-    """Minimal decoder wrapper to stream text and measure latency metrics."""
-
-    def __init__(self, model_id: str, device: str, provided_tokenizer: Optional[Any] = None, provided_model: Optional[Any] = None):
-        self.device = torch.device(device)
-        # Reuse provided tokenizer/model if available to avoid reloading per sample
-        self.tok = provided_tokenizer if provided_tokenizer is not None else AutoTokenizer.from_pretrained(model_id)
-        if self.tok.pad_token is None and getattr(self.tok, "eos_token", None) is not None:
-            self.tok.pad_token = self.tok.eos_token
-        self.mdl = provided_model if provided_model is not None else AutoModelForCausalLM.from_pretrained(model_id)
-        self.mdl = self.mdl.to(self.device).eval()
-
-    def _stream_generate(self, gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Run `generate` on a background thread and consume a TextIteratorStreamer."""
-        first_tok_t = None
-        pieces: List[str] = []
-        streamer = gen_kwargs["streamer"]
-
-        def consume():
-            nonlocal first_tok_t, pieces
-            for chunk in streamer:
-                if first_tok_t is None:
-                    first_tok_t = time.time()
-                pieces.append(chunk)
-
-        t0 = time.time()
-        t = Thread(target=lambda: self.mdl.generate(**gen_kwargs))
-        t.start()
-        consume()
-        t.join()
-        t1 = time.time()
-
-        num_toks = len(pieces)
-        e2e = t1 - t0
-        ttft = (first_tok_t - t0) if first_tok_t is not None else 0.0
-        throughput = (num_toks / e2e) if e2e > 0 else 0.0
-        tpot = (e2e / num_toks) if num_toks > 0 else 0.0
-
-        return {
-            "text": "".join(pieces),
-            "ttft": ttft,
-            "e2e_latency": e2e,
-            "throughput": throughput,
-            "tpot": tpot,
-            "decoded_tokens": num_toks,
-        }
-
-    def decode_with_saved_kvs(
-        self,
-        question_text: str,
-        past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
-        max_new_tokens: int = 10,
-    ) -> Dict[str, Any]:
-        """Decode `Answer:` given a question suffix, optionally with past KV."""
-        suffix = f"Question: {question_text}\nAnswer:"
-        enc = self.tok([suffix], return_tensors="pt", padding=True, truncation=False)
-        input_ids = enc["input_ids"].to(self.device)
-        attention_mask = enc.get("attention_mask", torch.ones_like(input_ids)).to(self.device)
-
-        streamer = TextIteratorStreamer(self.tok, skip_prompt=True, skip_special_tokens=True)
-        gen_kwargs: Dict[str, Any] = dict(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            streamer=streamer,
-            return_dict_in_generate=True,
-        )
-
-        if past is not None and len(past) > 0 and past[0][0].shape[2] > 0:
-            cached_len = past[0][0].shape[2]
-            position_ids = torch.arange(cached_len, cached_len + input_ids.shape[1], device=self.device).unsqueeze(0)
-            cache_position = torch.arange(cached_len, cached_len + input_ids.shape[1], device=self.device)
-            gen_kwargs.update({
-                "past_key_values": tuple((k.contiguous(), v.contiguous()) for k, v in past),
-                "position_ids": position_ids,
-                "cache_position": cache_position,
-            })
-
-        out = self._stream_generate(gen_kwargs)
-        return {
-            "answer": out["text"].strip(),
-            "ttft": out["ttft"],
-            "e2e_latency": out["e2e_latency"],
-            "throughput": out["throughput"],
-            "tpot": out["tpot"],
-            "decoded_tokens": out["decoded_tokens"],
-        }
-
-
 # ---------------- main pipeline ----------------
 
 def main():
-    """Entry point: runs retrieval → KV build (top‑k only) → decode → schedule → decode."""
-    ap = argparse.ArgumentParser("Full KV Reuse Pipeline WITH speculative + scheduler (fixed)")
+    """CORRECTED: Main pipeline with proper retrieval integration"""
+    ap = argparse.ArgumentParser("Full KV Reuse Pipeline WITH speculative scheduler (fixed)")
     ap.add_argument("--config", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/configs/config.yaml", help="Path to config.yaml")
     ap.add_argument("--input", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/inputs/musique_s.json", help="Path to input dataset JSON")
     ap.add_argument("--output", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/results/pipeline_results", help="Output directory")
     ap.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
     args = ap.parse_args()
-
+    
     os.makedirs(args.output, exist_ok=True)
-    logger = _setup_logging(args.log_level)
-
-    with open(args.config, "r") as f:
+    logger = setup_logging(args.log_level)
+    
+    with open(args.config, 'r') as f:
         cfg = yaml.safe_load(f)
-
-    # --- basics ---
+    
     model_id = cfg["model"]["model_name"]
     device = cfg["model"].get("device", "cuda:0")
+    
     logger.info(f"[Config] Model: {model_id} | Device: {device}")
     logger.info(f"[Paths] Output root: {args.output}")
-
-    # Load dataset
+    
+    # --- Load dataset ---
     logger.info(f"[Input] Loading dataset: {args.input}")
-    samples = _load_samples(args.input)
+    samples = load_samples(args.input)
     logger.info(f"[Input] Loaded {len(samples)} samples")
-
-    # Output paths
-    retrieval_json_path = _abs_path(args.output, cfg["paths"]["retrieval_json"])
-    kv_summary_path = _abs_path(args.output, cfg["paths"]["kv_summary_json"])
-    sched_out_path = _abs_path(args.output, cfg["scheduler"].get("out_path", "scheduler/decoder_trace.json"))
-    per_step_debug_path = os.path.join(args.output, "per_step_debug.json")  # New debug output
-    final_results_path = os.path.join(args.output, "final_results.json")
+    
+    # --- Output paths ---
+    retrieval_json_path = abs_path(args.output, cfg["paths"]["retrieval_json"])
     summary_path = os.path.join(args.output, "summary.json")
-
-    # Retrieval (skip if JSON already exists)
-    maybe_existing = _load_existing_retrieval(retrieval_json_path, logger)
+    per_step_debug_path = os.path.join(args.output, "per_step_debug.json")
+    sched_out_path = abs_path(args.output, cfg["scheduler"].get("out_path", "scheduler/decoder_trace.json"))
+    
+    # --- CRITICAL: Check for existing retrieval first ---
+    maybe_existing = load_existing_retrieval(retrieval_json_path, logger)
     if maybe_existing is not None:
         samples = maybe_existing
-
-    # Objects
+    
+    # --- Retrieval (skip if JSON already exists) ---
     retriever = None
     if maybe_existing is None:
-        rconf = RetrievalConfig(
+        r_conf = RetrievalConfig(
             model_id=cfg["retrieval"]["model_id"],
             dataset_name=cfg["retrieval"]["dataset_name"],
             r_text_index_key=cfg["retrieval"]["r_text_index_key"],
@@ -438,69 +140,64 @@ def main():
             question_key=cfg["retrieval"]["question_key"],
             retrieved_key=cfg["retrieval"]["retrieved_key"],
             page_id_key=cfg["retrieval"]["page_id_key"],
-            top_k=int(cfg["retrieval"]["top_k"]),
+            top_k=int(cfg["retrieval"]["top_k"])
         )
-        retriever = ColbertRetrieval(rconf)
-
-    kv_builder = KVCachesBuilder()
+        retriever = ColbertRetrieval(r_conf)
+    
+    # --- Initialize shared components ---
     scheduler = TangoScheduler()
-
-    # Instantiate shared tokenizer/model once and reuse across stages
     shared_tokenizer = AutoTokenizer.from_pretrained(model_id)
-    if shared_tokenizer.pad_token is None and getattr(shared_tokenizer, "eos_token", None) is not None:
+    if shared_tokenizer.pad_token is None and getattr(shared_tokenizer, 'eos_token', None) is not None:
         shared_tokenizer.pad_token = shared_tokenizer.eos_token
     shared_model = AutoModelForCausalLM.from_pretrained(model_id).to(torch.device(device)).eval()
-
-    decoder = FinalDecoder(model_id=model_id, device=device, provided_tokenizer=shared_tokenizer, provided_model=shared_model)
-
-    aggregated_kv: List[Dict[str, Any]] = []
-    sched_trace_all: List[Dict[str, Any]] = []
-    per_step_debug_all: List[Dict[str, Any]] = []  # New debug collection
-    final_answers: List[Dict[str, Any]] = []
-
-    kv_root = _abs_path(args.output, cfg["kv_builder"].get("save_cache_dir", "kv_caches"))
-
+    
     logger.info("[Pipeline] Running full_kv_reuse + speculative + scheduler (fixed)")
-    for si in tqdm(range(1), desc="Samples", unit="sample"):
+    
+    final_answers = []
+    per_step_debug_all = []
+    sched_trace_all = []
+    
+    for si in tqdm(range(1), desc="Samples", unit="sample"):  # Process 1 sample for now
         sample = samples[si]
-        sample_id = str(sample.get("id", f"sample{si}"))
-
-        # 1) Retrieval (if not preloaded) -> flush retrieval.json
+        sample_id = str(sample.get("id", f"sample_{si}"))
+        
+        # --- 1. RETRIEVAL (if not pre-loaded) ---
         if maybe_existing is None:
+            logger.info(f"[Sample {si}] Running retrieval...")
             enriched = retriever.prepare([sample])
             enriched = retriever.retrieve(enriched)
             sample = enriched[0]
             samples[si] = sample
-            _write_json(retrieval_json_path, samples)
-
-        # 2) Skip separate KV build - let the per-step scheduler handle it
-        # Build top‑k index list for initial GPU placement
-        topk_indices = _topk_indices_from_sample(sample, cfg)
+            
+            # Flush retrieval results after each sample (optional - for incremental saving)
+            write_json(retrieval_json_path, samples)
+        
+        # --- 2. Get initial GPU indices from retrieval results ---
+        topk_indices = topk_indices_from_sample(sample, cfg)
         gpu_indices_initial = sorted(set(int(i) for i in topk_indices))
-
-        # 3) Skip initial decoding - go directly to per-step
-
-        # 5) NEW: Per-step decoding with lightweight prediction + periodic scheduling
+        
+        logger.info(f"[Sample {si}] Initial GPU chunks from retrieval: {gpu_indices_initial}")
+        
+        # --- 3. FIXED: Per-step decoding with proper retrieval data ---
         per_step_result = scheduler.run_per_step_decode(
-            retr_samples=[sample],
+            retr_samples=[sample],  # Pass the sample WITH retrieval results
             model_id=model_id,
             device=device,
             dtype=str(cfg["model"].get("dtype", "auto")),
             max_gpu=int(cfg["scheduler"]["max_gpu"]),
             max_samples=1,
             max_new_tokens=cfg.get("generation", {}).get("max_new_tokens", 10),
-            scheduler_interval=int(cfg["scheduler"].get("scheduler_interval", 5)),  # Heavy scheduler every N tokens
+            scheduler_interval=int(cfg["scheduler"].get("scheduler_interval", 5)),
             provided_tokenizer=shared_tokenizer,
             provided_model=shared_model,
             promote_per_step=int(cfg["scheduler"].get("promote_per_step", 2)),
-            initial_gpu_indices=gpu_indices_initial,  # Pass initial GPU chunk selection
+            initial_gpu_indices=gpu_indices_initial or [1, 3, 4, 6, 9]  # Use retrieval results or fallback
         )
         
-        # Extract result for this sample
+        # --- 4. Extract and log results ---
         if per_step_result.get("results") and len(per_step_result["results"]) > 0:
             decode_metrics_final = per_step_result["results"][0]
             
-            # Print per-step debug info to terminal
             logger.info(f"[Sample {si}] Per-step decoding completed:")
             logger.info(f"  - Question: {sample.get('question', '')}")
             logger.info(f"  - Answer: {decode_metrics_final.get('answer', '')}")
@@ -510,7 +207,7 @@ def main():
             logger.info(f"  - TPOT: {decode_metrics_final.get('tpot', 0):.3f}s")
             logger.info(f"  - Throughput: {decode_metrics_final.get('throughput', 0):.2f} tokens/s")
             
-            # Update trace with sample index and collect debug info
+            # Collect debug information
             if "trace" in decode_metrics_final:
                 sample_debug = {
                     "sample_index": si,
@@ -527,116 +224,59 @@ def main():
                 }
                 per_step_debug_all.append(sample_debug)
                 
-                # Print token-by-token info
-                for i, token_info in enumerate(decode_metrics_final["trace"][:5]):  # Show first 5 tokens
-                    predictions = token_info.get("predictions", [])
-                    staging = token_info.get("staging_stats", {})
-                    # logger.info(f"    Token {i}: predicted chunks {[p[0] if isinstance(p, tuple) else p for p in predictions]}, "
-                    #           f"staging: {staging.get('predictions', 0)} pred, {staging.get('preparing', 0)} prep, {staging.get('ready', 0)} ready")
-                
-                # if len(decode_metrics_final["trace"]) > 5:
-                #     logger.info(f"    ... and {len(decode_metrics_final['trace']) - 5} more tokens")
-                
+                # Update trace with sample index
                 for row in decode_metrics_final["trace"]:
                     row["sample_index"] = si
                 sched_trace_all.extend(decode_metrics_final["trace"])
-                _write_json(sched_out_path, {"trace": sched_trace_all})
-                _write_json(per_step_debug_path, {"per_step_debug": per_step_debug_all})
+            
+            final_answers.append({
+                "sample_index": si,
+                "question": sample.get("question", ""),
+                "mode": "full_kv_reuse_per_step",
+                "gpu_indices_initial": gpu_indices_initial,
+                **decode_metrics_final
+            })
         else:
-            # Fallback to old method if per-step fails
-            logger.warning(f"[Sample {si}] Per-step decoding failed, falling back to standard decoding")
-            decode_metrics_final = decoder.decode_with_saved_kvs(
-                question_text=sample.get("question", ""),
-                past=past_init,
-                max_new_tokens=cfg.get("generation", {}).get("max_new_tokens", 10),
-            )
-
-        # Extract final GPU indices from the per-step result
-        final_gpu_indices = gpu_indices_initial  # Default fallback
-        if "trace" in decode_metrics_final and decode_metrics_final["trace"]:
-            # Get GPU chunks from last step
-            last_step = decode_metrics_final["trace"][-1]
-            final_gpu_indices = list(range(last_step.get("gpu_chunks", len(gpu_indices_initial))))
-        
-        # Record final row (initial metrics kept in case you wish to log separately)
-        final_answers.append({
-            "sample_index": si,
-            "question": sample.get("question", ""),
-            "mode": "full_kv_reuse_per_step",
-            "gpu_indices_initial": gpu_indices_initial,
-            "gpu_indices_final": final_gpu_indices,
-            **decode_metrics_final,
-        })
-
-        # Flush rolling results + summary
-        ttfts = [x["ttft"] for x in final_answers if x.get("ttft") is not None]
-        e2es = [x["e2e_latency"] for x in final_answers if x.get("e2e_latency") is not None]
-        thr = [x["throughput"] for x in final_answers if x.get("throughput") is not None]
-        tpot = [x["tpot"] for x in final_answers if x.get("tpot") is not None]
-
-        _write_json(final_results_path, {
-            "per_sample": final_answers,
-            "averages": {
-                "ttft": (sum(ttfts) / len(ttfts)) if ttfts else None,
-                "e2e_latency": (sum(e2es) / len(e2es)) if e2es else None,
-                "throughput": (sum(thr) / len(thr)) if thr else None,
-                "tpot": (sum(tpot) / len(tpot)) if tpot else None,
-            },
-            "count": len(final_answers)
-        })
-
-        _write_json(summary_path, {
-            "status": "running",
-            "processed": si + 1,
-            "total": len(samples),
-            "model": model_id,
-            "device": device,
-            "outputs": {
-                "retrieval_json": retrieval_json_path,
-                "kv_summary_json": kv_summary_path,
-                "scheduler_json": sched_out_path,
-                "per_step_debug_json": per_step_debug_path,
-                "final_results_json": final_results_path,
-                "kv_root": kv_root,
-            },
-            "timestamps": {"last_update": time.strftime("%Y-%m-%d %H:%M:%S")},
-        })
-
-    # Finalize
+            logger.warning(f"[Sample {si}] Per-step decoding failed")
+            # Could add fallback decoding here if needed
+    
+    # --- 5. Final output and summary ---
     if maybe_existing is None:
-        _write_json(retrieval_json_path, samples)
+        write_json(retrieval_json_path, samples)
         logger.info(f"[Output] Retrieval JSON: {retrieval_json_path}")
-
+    
+    # Calculate averages
     ttfts = [x["ttft"] for x in final_answers if x.get("ttft") is not None]
     e2es = [x["e2e_latency"] for x in final_answers if x.get("e2e_latency") is not None]
     thr = [x["throughput"] for x in final_answers if x.get("throughput") is not None]
     tpot = [x["tpot"] for x in final_answers if x.get("tpot") is not None]
-
-    _write_json(summary_path, {
+    
+    write_json(summary_path, {
         "status": "completed",
         "model": model_id,
         "device": device,
-        "counts": {"samples": len(samples)},
-        "outputs": {
-            "retrieval_json": retrieval_json_path,
-            "kv_summary_json": kv_summary_path,
-            "scheduler_json": sched_out_path,
-            "per_step_debug_json": per_step_debug_path,
-            "final_results_json": final_results_path,
-            "kv_root": kv_root,
-        },
+        "count": len(final_answers),
         "averages": {
-            "ttft": (sum(ttfts) / len(ttfts)) if ttfts else None,
-            "e2e_latency": (sum(e2es) / len(e2es)) if e2es else None,
-            "throughput": (sum(thr) / len(thr)) if thr else None,
-            "tpot": (sum(tpot) / len(tpot)) if tpot else None,
+            "ttft": sum(ttfts) / len(ttfts) if ttfts else None,
+            "e2e_latency": sum(e2es) / len(e2es) if e2es else None,
+            "throughput": sum(thr) / len(thr) if thr else None,
+            "tpot": sum(tpot) / len(tpot) if tpot else None,
         },
-        "timestamps": {"finished_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+        "results": final_answers,
+        "timestamps": {
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
     })
+    
+    if per_step_debug_all:
+        write_json(per_step_debug_path, {"per_step_debug": per_step_debug_all})
+        logger.info(f"[pipeline] Per-step debug info saved to: {per_step_debug_path}")
+    
+    if sched_trace_all:
+        write_json(sched_out_path, {"trace": sched_trace_all})
+        logger.info(f"[pipeline] Scheduler trace saved to: {sched_out_path}")
+    
     logger.info(f"[pipeline] Done. Summary: {summary_path}")
-    logger.info(f"[pipeline] Per-step debug info saved to: {per_step_debug_path}")
-    logger.info(f"[pipeline] Scheduler trace saved to: {sched_out_path}")
-
 
 if __name__ == "__main__":
     main()
