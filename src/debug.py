@@ -76,40 +76,40 @@ def test_mistral_specific():
         print(f"Input prompt: {input_prompt[:100]}...")
     
         with torch.no_grad():
-            # 使用KV Cache进行逐步生成
+            # Use KV Cache for step-by-step generation
             current_input = torch.tensor([input_ids], device="cuda")
             generated_tokens = []
-            max_tokens = 20  # 最大生成token数量
-            past_key_values = None  # 初始化KV Cache
+            max_tokens = 20  # Maximum number of tokens to generate
+            past_key_values = None  # Initialize KV Cache
             
-            print("开始使用KV Cache逐步生成:")
+            print("Starting KV Cache step-by-step generation:")
             
             for step in range(max_tokens):
                 if step == 0:
-                    # 第一次：处理整个输入序列，生成KV Cache
+                    # First time: process entire input sequence, generate KV Cache
                     outputs = model(
                         current_input,
                         use_cache=True,
                         return_dict=True
                     )
                     past_key_values = outputs.past_key_values
-                    # 获取第一个生成的token
+                    # Get the first generated token
                     next_token_logits = outputs.logits[:, -1, :]
                     next_token = torch.multinomial(
                         torch.softmax(next_token_logits / 0.7, dim=-1), 
                         num_samples=1
                     ).squeeze(-1)
                 else:
-                    # 后续步骤：只处理新的token，使用缓存的KV
+                    # Subsequent steps: only process new token, use cached KV
                     outputs = model(
-                        next_token.unsqueeze(-1),  # 只传入新token
+                        next_token.unsqueeze(-1),  # Only pass new token
                         past_key_values=past_key_values,
                         use_cache=True,
                         return_dict=True
                     )
-                    # 更新KV Cache
+                    # Update KV Cache
                     past_key_values = outputs.past_key_values
-                    # 获取下一个token
+                    # Get next token
                     next_token_logits = outputs.logits[:, -1, :]
                     next_token = torch.multinomial(
                         torch.softmax(next_token_logits / 0.7, dim=-1), 
@@ -118,35 +118,35 @@ def test_mistral_specific():
                 
                 new_token = next_token.item()
                 
-                # 检查是否遇到结束符
+                # Check if end token is encountered
                 if new_token == tokenizer.eos_token_id:
-                    print(f"步骤 {step+1}: 遇到结束符，停止生成")
+                    print(f"Step {step+1}: End token encountered, stopping generation")
                     break
                 
                 generated_tokens.append(new_token)
                 
-                # 解码并显示当前生成的文本
+                # Decode and display currently generated text
                 current_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                print(f"步骤 {step+1}: 新token={new_token}, 当前文本='{current_text}'")
+                print(f"Step {step+1}: New token={new_token}, Current text='{current_text}'")
                 
-                # 显示KV Cache信息
+                # Display KV Cache information
                 if past_key_values is not None:
                     cache_size = sum(kv[0].shape[2] for kv in past_key_values) // len(past_key_values)
-                    print(f"  KV Cache长度: {cache_size}")
+                    print(f"  KV Cache length: {cache_size}")
             
-            # 最终结果
+            # Final results
             final_generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            print(f"\n最终生成文本: '{final_generated_text}'")
+            print(f"\nFinal generated text: '{final_generated_text}'")
             
-            # 完整文本（输入+生成）
+            # Complete text (input + generated)
             full_text = tokenizer.decode(input_ids + generated_tokens, skip_special_tokens=True)
-            print(f"完整文本: {full_text}")
+            print(f"Complete text: {full_text}")
             
-            # 显示性能信息
-            print(f"\n性能统计:")
-            print(f"生成token数量: {len(generated_tokens)}")
-            print(f"输入token数量: {len(input_ids)}")
-            print(f"总token数量: {len(input_ids) + len(generated_tokens)}")
+            # Display performance information
+            print(f"\nPerformance statistics:")
+            print(f"Generated token count: {len(generated_tokens)}")
+            print(f"Input token count: {len(input_ids)}")
+            print(f"Total token count: {len(input_ids) + len(generated_tokens)}")
     
     return True
 
@@ -197,11 +197,11 @@ def test_basic_generation():
 if __name__ == "__main__":
     print("Starting transformers debug tests with KV Cache...\n")
     
-    # Test basic generation
-    print("=== Basic Generation Test ===")
-    success1 = test_basic_generation()
+    # # Test basic generation
+    # print("=== Basic Generation Test ===")
+    # success1 = test_basic_generation()
     
-    print("\n=== KV Cache Optimized Generation Test ===")
+    # print("\n=== KV Cache Optimized Generation Test ===")
     # Test Mistral with KV Cache optimization
     success2 = test_mistral_specific()
     
