@@ -190,12 +190,13 @@ class TangoScheduler:
         dtype: str = "auto",
         max_gpu: int = 5,
         max_samples: int = 1,
-        max_new_tokens: int = 10,
+        max_new_tokens: int = 32,
         scheduler_interval: int = 5,  # Run heavy scheduler every N tokens
         provided_tokenizer: Optional[Any] = None,
         provided_model: Optional[Any] = None,
         promote_per_step: int = 2,
         initial_gpu_indices: List[int] = None,  # Initial GPU chunk placement
+        use_original_decode: bool = False,
     ) -> Dict[str, Any]:
         """
         New per-step decoding with lightweight prediction and periodic heavy scheduling.
@@ -225,6 +226,24 @@ class TangoScheduler:
             sample_id = f"{si}"
             texts_idx: List[Tuple[int, str]] = extract_texts(sample)
             
+            # Optional path: run original decoding (no KV-cache scheduling), for debugging/baseline
+            if use_original_decode:
+                print(f"[OriginalDecode] Sample {si}: running original step-by-step decoding without KV scheduler")
+                result = self._decode_per_step_original(
+                    sample=sample,
+                    texts_idx=texts_idx,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device_t=device_t,
+                    max_new_tokens=max_new_tokens
+                )
+                results.append({
+                    "sample_index": si,
+                    "sample_id": sample_id,
+                    **result
+                })
+                continue
+
             # Initialize KV cache manager
             kv = KVCacheManager(
                 model_config={
@@ -962,3 +981,110 @@ class TangoScheduler:
         else:
             print("KVCache: Failed to build past_key_values - no valid entries")
             return None
+
+    def _decode_per_step_original(self, sample: Dict[str, Any], texts_idx: List[Tuple[int, str]],
+                                  model, tokenizer, device_t: torch.device, max_new_tokens: int) -> Dict[str, Any]:
+        """
+        Original step-by-step decoding adapted from debug.py, without KV scheduler.
+        Uses current model/tokenizer and builds a simple passages+question prompt.
+        """
+        # Build prompt roughly matching debug.py style
+        prefix_prompt = (
+            "You will be asked a question after reading several passages. "
+            "Please directly answer the question based on the given passages. "
+            "Do NOT repeat the question. The answer should be within 10 words..\nPassages:\n"
+        )
+        query_prompt = (
+            "\n\nAnswer the question directly based on the given passages. "
+            "Do NOT repeat the question. The answer should be within 10 words. \nQuestion:"
+        )
+
+        passages = [t for _, t in texts_idx]
+        question_text = str(sample.get("question", "")).strip()
+
+        # Create list of document prompts similar to debug.py's build_qa_prompt output
+        doc_prompts = passages
+        q_prompt = query_prompt + question_text
+
+        doc_chunk_ids = [tokenizer.encode(doc, add_special_tokens=True)[1:] for doc in doc_prompts]
+        q_ids = tokenizer.encode(q_prompt, add_special_tokens=True)[1:]
+
+        # Static tokens copied from debug.py for Mistral; leave as-is for baseline testing
+        s_start_full = [733, 16289, 28793] + tokenizer.encode(prefix_prompt, add_special_tokens=True)[1:]
+        s_start = []
+        s_start_1_len = len(s_start) + 1
+        s_end = [733, 28748, 16289, 28793]
+
+        # Assemble input ids as in debug.py
+        doc_chunk_ids = [s_start + chunk_ids for chunk_ids in doc_chunk_ids]
+        doc_chunk_ids = [s_start_full] + doc_chunk_ids
+        doc_chunk_ids = doc_chunk_ids + [s_start + q_ids + s_end]
+
+        input_ids_list: List[int] = []
+        for i in range(len(doc_chunk_ids)):
+            if i == 0:
+                temp_ids = doc_chunk_ids[i]
+            else:
+                temp_ids = doc_chunk_ids[i][s_start_1_len-1:]
+            input_ids_list += temp_ids
+
+        # Run original stepwise generation with model cache only
+        generated_tokens: List[int] = []
+        trace: List[Dict[str, Any]] = []
+        start_time = time.time()
+        first_token_time: Optional[float] = None
+
+        with torch.no_grad():
+            current_input = torch.tensor([input_ids_list], device=device_t)
+            past_key_values = None
+
+            for step in range(int(max_new_tokens)):
+                if step == 0:
+                    outputs = model(
+                        current_input,
+                        use_cache=True,
+                        return_dict=True
+                    )
+                    past_key_values = outputs.past_key_values
+                    next_token_logits = outputs.logits[:, -1, :]
+                    probs = torch.softmax(next_token_logits / 0.7, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                else:
+                    outputs = model(
+                        next_token.unsqueeze(-1),
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        return_dict=True
+                    )
+                    past_key_values = outputs.past_key_values
+                    next_token_logits = outputs.logits[:, -1, :]
+                    probs = torch.softmax(next_token_logits / 0.7, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+                token_id = int(next_token.item())
+
+                if first_token_time is None:
+                    first_token_time = time.time()
+
+                if token_id == getattr(tokenizer, 'eos_token_id', None):
+                    break
+
+                generated_tokens.append(token_id)
+                decoded_piece = tokenizer.decode([token_id], skip_special_tokens=True)
+                trace.append({"token_step": step, "token": token_id, "decoded_token": decoded_piece})
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        tpot = (total_time / len(generated_tokens)) if generated_tokens else 0.0
+        ttft = (first_token_time - start_time) if first_token_time else 0.0
+
+        return {
+            "answer": generated_text,
+            "ttft": ttft,
+            "e2e_latency": total_time,
+            "throughput": (len(generated_tokens) / total_time) if total_time > 0 else 0.0,
+            "tpot": tpot,
+            "decoded_tokens": len(generated_tokens),
+            "trace": trace
+        }

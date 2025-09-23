@@ -47,7 +47,7 @@ kv_builder:
 
 # -------- Generation Settings --------
 generation:
-  max_new_tokens: 10       # Maximum tokens to generate per sample
+  max_new_tokens: 32       # Maximum tokens to generate per sample
 
 # -------- Per-Step Scheduler --------
 scheduler:

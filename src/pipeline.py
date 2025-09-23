@@ -191,7 +191,8 @@ def main():
             provided_tokenizer=shared_tokenizer,
             provided_model=shared_model,
             promote_per_step=int(cfg["scheduler"].get("promote_per_step", 2)),
-            initial_gpu_indices=gpu_indices_initial or [1, 3, 4, 6, 9]  # Use retrieval results or fallback
+            initial_gpu_indices=gpu_indices_initial,
+            use_original_decode=True
         )
         
         # --- 4. Extract and log results ---

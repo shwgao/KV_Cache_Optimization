@@ -7,7 +7,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from utils import load_dataset, normalize_question, build_qa_prompt, compute_f1
 from pathlib import Path
 
-eval_dataset = load_dataset("inputs/musique_s.json")
+eval_dataset = load_dataset("/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/inputs/musique_s.json")
 
 prefix_prompt = "You will be asked a question after reading several passages. Please directly answer the question based on the given passages. Do NOT repeat the question. The answer should be within 5 words..\nPassages:\n"
 query_prompt = "\n\nAnswer the question directly based on the given passages. Do NOT repeat the question. The answer should be within 5 words. \nQuestion:"
@@ -26,7 +26,6 @@ def test_mistral_specific():
         
     model = AutoModelForCausalLM.from_pretrained(
         "mistralai/Mistral-7B-Instruct-v0.2",
-        dtype=torch.float16,
         trust_remote_code=True
     ).to("cuda")
     
@@ -164,7 +163,6 @@ def test_basic_generation():
         
     model = AutoModelForCausalLM.from_pretrained(
         "mistralai/Mistral-7B-Instruct-v0.2",
-        dtype=torch.float16,
         trust_remote_code=True
     ).to("cuda")
     
@@ -206,7 +204,7 @@ if __name__ == "__main__":
     success2 = test_mistral_specific()
     
     print(f"\n=== Test Summary ===")
-    print(f"Basic generation test: {'✓ PASSED' if success1 else '✗ FAILED'}")
+    print(f"Basic generation test: {'✓ PASSED' if success2 else '✗ FAILED'}")
     print(f"KV Cache test: {'✓ PASSED' if success2 else '✗ FAILED'}")
     
     print("\nDebug tests completed!")
