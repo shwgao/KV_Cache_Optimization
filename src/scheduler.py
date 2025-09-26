@@ -226,7 +226,22 @@ class TangoScheduler:
             sample_id = f"{si}"
             texts_idx: List[Tuple[int, str]] = extract_texts(sample)
             
-            # Optional path: run original decoding (no KV-cache scheduling), for debugging/baseline
+            q = f"Question: {sample.get('question','')}"
+            q_ids = tokenizer(q, return_tensors="pt", padding=True, truncation=False)["input_ids"].to(device_t)
+            question_length = int(q_ids.shape[1])
+
+            # 2) token lengths per chunk (numeric order by idx)
+            texts_only = [t for _, t in texts_idx]
+            tok_lens = [len(tokenizer.encode(t, add_special_tokens=False)) for t in texts_only]
+
+            # 3) absolute start positions for every chunk: start at Q and grow
+            abs_starts: Dict[int, int] = {}
+            running = question_length
+            for idx, _ in sorted(texts_idx, key=lambda x: x[0]):   # enforce numeric order
+                abs_starts[idx] = running
+                running += tok_lens[idx]
+
+            # Original Model decoding
             if use_original_decode:
                 print(f"[OriginalDecode] Sample {si}: running original step-by-step decoding without KV scheduler")
                 result = self._decode_per_step_original(
@@ -281,12 +296,15 @@ class TangoScheduler:
                     inputs = _tokenize_chunk(tokenizer, text, device_t)
                     seq_len = inputs["input_ids"].shape[1]
 
-                    # Create position_ids starting from cumulative position
-                    position_ids = torch.arange(
-                        cumulative_position, 
-                        cumulative_position + seq_len, 
-                        device=device_t
-                    ).unsqueeze(0)
+                    # # Create position_ids starting from cumulative position
+                    # position_ids = torch.arange(
+                    #     cumulative_position, 
+                    #     cumulative_position + seq_len, 
+                    #     device=device_t
+                    # ).unsqueeze(0)
+                    start = abs_starts[idx]      # << use absolute start (includes Q)
+                    position_ids = torch.arange(start, start + seq_len, device=device_t).unsqueeze(0)
+
                     inputs["position_ids"] = position_ids
                     
                     print(f"[RoPE] Chunk {idx}: positions [{cumulative_position}:{cumulative_position + seq_len}]")
@@ -299,6 +317,7 @@ class TangoScheduler:
                         relevance_score=1.0,
                         model_outputs=outputs,
                     )
+                    entry.metadata.start_pos = int(start)
 
                     kv.store_chunk(cid, entry, priority="gpu")
                     cumulative_position += seq_len
@@ -314,6 +333,7 @@ class TangoScheduler:
                         relevance_score=0.0,
                     )
                     kv.store_chunk(cid, placeholder, priority="cpu")
+                    placeholder.metadata.start_pos = int(abs_starts[idx])
             
             # Prepare bandit features
             texts_only = [t for _, t in texts_idx]
@@ -881,17 +901,20 @@ class TangoScheduler:
                 inputs = _tokenize_chunk(tokenizer, text, device_t)
                 seq_len = inputs["input_ids"].shape[1]
                 
-                # Use estimated positions for background chunks
-                avg_chunk_length = 500  # Rough estimate
-                estimated_start_position = idx * avg_chunk_length
+                # # Use estimated positions for background chunks
+                # avg_chunk_length = 500  # Rough estimate
+                # estimated_start_position = idx * avg_chunk_length
                 
-                position_ids = torch.arange(
-                    estimated_start_position, estimated_start_position + seq_len, 
-                    device=device_t
-                ).unsqueeze(0)
+                # position_ids = torch.arange(
+                #     estimated_start_position, estimated_start_position + seq_len, 
+                #     device=device_t
+                # ).unsqueeze(0)
+                entry_meta = (kv.cpu_cache.get(chunk_id) or kv.gpu_cache.get(chunk_id)).metadata
+                start = int(getattr(entry_meta, "start_pos", 0))  # fallback 0 if missing
+                position_ids = torch.arange(start, start + seq_len, device=device_t).unsqueeze(0)
                 inputs["position_ids"] = position_ids
                 
-                print(f"RoPE: Background chunk {chunk_id} estimated positions [{estimated_start_position}:{estimated_start_position + seq_len}]")
+                print(f"RoPE: Background chunk {chunk_id} estimated positions")
                 
                 # Generate KV cache
                 outputs = _prefill_get_past(model, inputs)
@@ -924,7 +947,10 @@ class TangoScheduler:
             return None
             
         entries = []
-        for chunk_id in sorted(current_gpu_chunks):
+        def _chunk_num(cid: str) -> int:
+            return int(cid.split("_chunk")[1])
+
+        for chunk_id in sorted(current_gpu_chunks, key=_chunk_num):
             if chunk_id in kv.gpu_cache:
                 entry = kv.gpu_cache[chunk_id]
                 entries.append((chunk_id, entry))

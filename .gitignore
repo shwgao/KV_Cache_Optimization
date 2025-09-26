@@ -7,3 +7,6 @@ colbert_index/
 .ragatouille/
 results/kv_caches/
 results/
+src/build_kv_cache.py
+src/scheduler.py
+src/pipeline.py
