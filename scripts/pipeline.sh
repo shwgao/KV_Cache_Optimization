@@ -9,7 +9,7 @@
 # INPUT="inputs/musique_s.json"       
 # OUTPUT="results/pipeline_results"   
 
-mkdir -p "results/pipeline_v2_results/musique"
+mkdir -p "results/pipeline_v3_results/musique"
 
 # "$PYTHON" "src/pipeline.py" \
 #   --config "$CONFIG" \
@@ -18,11 +18,11 @@ mkdir -p "results/pipeline_v2_results/musique"
 
 #!/usr/bin/env bash
 
-python3 src/pipeline_v2.py \
+python3 src/pipeline_v3.py \
     --input inputs/musique_s.json \
-    --output_dir results/pipeline_v2_results/musique \
+    --output_dir results/pipeline_v3_results/musique \
     --model_id mistralai/Mistral-7B-Instruct-v0.2 \
     --top_k 5 \
-    --max_tokens 20 \
+    --max_tokens 32 \
     --device cuda:0
 

@@ -14,11 +14,31 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
 from tqdm import tqdm
+import numpy as np
 
 # Local imports
 from rag_retrieval import RetrievalConfig, ColbertRetrieval
 from build_kv_v2 import build_chunk_kv_caches, build_qa_prompt, QUERY_PROMPT
 from scheduler_v2 import BanditScheduler
+
+def convert_to_serializable(obj):
+    """Convert NumPy/PyTorch types to JSON-serializable Python types"""
+    if isinstance(obj, dict):
+        return {key: convert_to_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().item() if obj.numel() == 1 else obj.detach().cpu().tolist()
+    elif hasattr(obj, 'item'):  # PyTorch scalars
+        return obj.item()
+    else:
+        return obj
 
 def setup_logging(level: str = "INFO") -> logging.Logger:
     """Setup logging and return logger"""
@@ -481,7 +501,8 @@ def run_pipeline(
     # 5. Save results
     out_path = os.path.join(output_dir, "result.json")
     with open(out_path, "w") as f:
-        json.dump({"results": results}, f, indent=2)
+        serializable_results = convert_to_serializable({"results": results})
+        json.dump(serializable_results, f, indent=2)
     logger.info(f"Saved results to {out_path}")
 
     return {"output_path": out_path, "count": len(results)}
