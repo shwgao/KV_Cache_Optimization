@@ -495,55 +495,19 @@ def _create_sparse_kv_cache_from_chunks(full_kv_cache, chunk_boundaries, decode_
     # Create sparse KV cache by selecting only the keep positions
     # CRITICAL: We keep the original positions to preserve RoPE encoding
     sparse_kv_cache = []
-    for layer_kv in full_kv_cache:
+    for layer_idx, layer_kv in enumerate(full_kv_cache):
         keys, values = layer_kv
-        # Select only the positions we want to keep
-        sparse_keys = keys[:, :, keep_positions, :]
-        sparse_values = values[:, :, keep_positions, :]
-        sparse_kv_cache.append((sparse_keys, sparse_values))
-    
-    # Return the same type as the original cache to maintain compatibility
-    if hasattr(full_kv_cache, '__class__'):
-        # Try to create the same type of object
-        try:
-            return full_kv_cache.__class__(sparse_kv_cache)
-        except:
-            # Fallback to tuple if we can't recreate the original type
-            return tuple(sparse_kv_cache)
-    else:
-        return tuple(sparse_kv_cache)
-
-
-def _create_sparse_kv_cache(full_kv_cache, chunk_boundaries, selected_chunk_indices):
-    """
-    Create a sparse KV cache by selecting only specific chunks from the full cache.
-    
-    Args:
-        full_kv_cache: Complete KV cache from prefill
-        chunk_boundaries: List of (start, end) positions for each chunk
-        selected_chunk_indices: Indices of chunks to keep in sparse cache
-    
-    Returns:
-        Sparse KV cache containing only selected chunks
-    """
-    if not selected_chunk_indices:
-        return full_kv_cache
-    
-    # Calculate which token positions to keep
-    keep_positions = []
-    for chunk_idx in selected_chunk_indices:
-        if chunk_idx < len(chunk_boundaries):
-            start, end = chunk_boundaries[chunk_idx]
-            keep_positions.extend(range(start, end))
-    
-    if not keep_positions:
-        return full_kv_cache
-    
-    # Create sparse KV cache by selecting only the keep positions
-    # We need to maintain the same structure as the original cache
-    sparse_kv_cache = []
-    for layer_kv in full_kv_cache:
-        keys, values = layer_kv
+        
+        # Check if keep_positions are within bounds
+        max_seq_len = values.shape[2]
+        invalid_positions = [pos for pos in keep_positions if pos >= max_seq_len]
+        if invalid_positions:
+            # Filter out invalid positions
+            keep_positions = [pos for pos in keep_positions if pos < max_seq_len]
+        
+        if not keep_positions:
+            return full_kv_cache
+        
         # Select only the positions we want to keep
         sparse_keys = keys[:, :, keep_positions, :]
         sparse_values = values[:, :, keep_positions, :]
@@ -580,14 +544,19 @@ def test_mistral_adaptive_sparse_attention():
     print(f"✓ Mistral adaptive sparse attention model loaded successfully")
     
     # Configuration for adaptive sparse attention
-    max_prefill_chunks = 8  # Maximum chunks to use in prefill
+    max_prefill_chunks = 12  # Maximum chunks to use in prefill
     min_decode_chunks = 2   # Minimum chunks to keep during decode
     max_decode_chunks = 5   # Maximum chunks to keep during decode
     relevance_threshold = 0.3  # Threshold for chunk relevance
     max_tokens = 20
     
+    global DEBUG
+    f1 = []
+    ttft = []
+    tpot = []
+    
     run_idx = 0
-    max_run = 1
+    max_run = 5000
     for ex in eval_dataset:
         run_idx += 1
         if run_idx > max_run:
@@ -746,7 +715,7 @@ def test_mistral_adaptive_sparse_attention():
                         current_doc_indices = [doc_chunk_indices[i] for i in selected_doc_indices]
                         current_chunk_indices = [prefix_chunk_idx] + current_doc_indices + [query_chunk_idx]
                         print(f"Step {step}: Updated chunk selection: {current_chunk_indices}")
-                        print(f"Step {step}: Updated chunk types: {[chunk_types[i] for i in current_chunk_indices]}")
+                        # print(f"Step {step}: Updated chunk types: {[chunk_types[i] for i in current_chunk_indices]}")
                         
                         # Update sparse KV cache with new chunk selection
                         sparse_kv_cache = _create_sparse_kv_cache_from_chunks(
@@ -784,34 +753,31 @@ def test_mistral_adaptive_sparse_attention():
                 
                 generated_tokens.append(new_token)
                 
-                # Decode and display currently generated text
-                current_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                print(f"Step {step+1}: New token={new_token}, Current text='{current_text}'")
-                print(f"  Active chunks: {current_chunk_indices}")
+                # # Decode and display currently generated text
+                # current_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                # print(f"Step {step+1}: New token={new_token}, Current text='{current_text}'")
+                # print(f"  Active chunks: {current_chunk_indices}")
             
             decode_time = time.time() - decode_start_time
             
             # Final results
             final_generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
             print(f"\nFinal generated text: '{final_generated_text}'")
+            print(f"answers: {answers}")
             
-            # Performance statistics
-            print(f"\n=== ADAPTIVE SPARSE ATTENTION PERFORMANCE ===")
-            print(f"Prefill phase:")
-            print(f"  - Total chunks used: {len(prefill_chunk_indices)}/{len(chunk_boundaries)}")
-            print(f"  - Document chunks used: {len(prefill_doc_indices)}/{len(doc_chunk_indices)}")
-            print(f"  - Tokens processed: {len(prefill_input_ids)}")
-            print(f"  - Time: {prefill_time:.3f}s")
-            print(f"Decode phase:")
-            print(f"  - Final active chunks: {len(current_chunk_indices)}")
-            print(f"  - Final document chunks used: {len(current_doc_indices)}/{len(doc_chunk_indices)}")
-            print(f"  - Generated tokens: {len(generated_tokens)}")
-            print(f"  - Time: {decode_time:.3f}s")
-            print(f"  - TPOT: {decode_time/len(generated_tokens):.3f}s/token")
-            print(f"Overall:")
-            print(f"  - Total time: {prefill_time + decode_time:.3f}s")
-            print(f"  - Document chunk efficiency: {len(current_doc_indices)}/{len(doc_chunk_indices)} ({len(current_doc_indices)/len(doc_chunk_indices):.1%})")
-            print(f"  - Memory efficiency: Using sparse KV cache with selected chunks only")
+            f1.append(max(compute_f1(final_generated_text, answer, tokenizer) for answer in answers))
+            ttft.append(prefill_time)
+            tpot.append(decode_time/len(generated_tokens))
+            
+            print(f"TTFT: {ttft[-1]:.3f}s")
+            print(f"TPOT: {tpot[-1]:.3f}s/token")
+            print(f"F1: {f1[-1]:.3f}")
+            print(f"average F1: {sum(f1)/len(f1):.3f}")
+            
+    print(f"------------>Average:<------------")
+    print(f"TTFT: {sum(ttft)/len(ttft):.3f}s")
+    print(f"TPOT: {sum(tpot)/len(tpot):.3f}s/token")
+    print(f"F1: {sum(f1)/len(f1):.3f}")
     
     return True
 
@@ -925,10 +891,10 @@ if __name__ == "__main__":
     
     # Test sparse attention
     # print("\n=== Sparse Attention Test ===")
-    success3 = test_mistral_sparse_attention()
+    # success3 = test_mistral_sparse_attention()
     
     # # Test adaptive sparse attention
     # print("\n=== Adaptive Sparse Attention Test ===")
-    # success4 = test_mistral_adaptive_sparse_attention()
+    success4 = test_mistral_adaptive_sparse_attention()
     
     print("\nDebug tests completed!")
