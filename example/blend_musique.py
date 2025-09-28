@@ -22,7 +22,7 @@ ttft_full = []
 f1_blend = []
 f1_full = []
 
-max_run = 10
+max_run = 5000
 run_idx = 0
 
 for ex in eval_dataset:

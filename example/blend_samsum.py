@@ -9,7 +9,7 @@ from itertools import chain
 
 eval_dataset = load_dataset("inputs/samsum.json")
 
-llm = LLM(model="mistralai/Mistral-7B-Instruct-v0.2", gpu_memory_utilization=0.5)
+llm = LLM(model="mistralai/Mistral-7B-Instruct-v0.2", gpu_memory_utilization=0.8, dtype=torch.float16, enforce_eager=True)
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
 llm.set_tokenizer(tokenizer)
 
